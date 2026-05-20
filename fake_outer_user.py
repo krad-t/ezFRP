@@ -4,7 +4,7 @@ from protocol import SERVER_IP
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.connect((SERVER_IP,9999))
 while True:
-    data = input("input anything(q to quit):")
+    data = input(f"input anything(q to quit){s.getsockname()}:")
     if data == 'q':
         break
     else:
