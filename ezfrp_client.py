@@ -1,7 +1,7 @@
 from datetime import datetime
 import socket
 import threading
-from protocol import *
+from protocol import SERVER_IP,CONTROL_PORT
 
 control_channel: socket.socket = None
 

@@ -10,13 +10,18 @@ def handle_control():
     # 线程 1：监听 :7000，处理 Client 控制消息
     server_control.bind(("0.0.0.0", CONTROL_PORT))
     server_control.listen(1)
-    control_channel, addr = server_control.accept()
-    print("Connected by client[control]", addr)
     # control_channel 专门用来处理控制消息
     while True:
-        cmd = control_channel.recv(1024)
-        # 处理控制消息
-        print(cmd.decode('utf-8'))
+        control_channel, addr = server_control.accept()
+        print("Connected by client[control]", addr)
+        while True:
+            try:
+                cmd = control_channel.recv(1024)
+                # 处理控制消息
+                print(cmd.decode('utf-8'))
+            except (ConnectionResetError, OSError):
+                print("Client disconnected, waiting for reconnect...")
+                break
 
 
 def handle_public():
@@ -27,7 +32,11 @@ def handle_public():
         conn_user, addr = server_public.accept()
         print("Connected to public[outerUser]", addr)
         # 此时新的用户连接进来了，我们才需要向client发送new指令，然后再拿到代表data socket的抽象代表
-        control_channel.send(bytes('new', 'utf-8'))
+        if control_channel is not None:
+            control_channel.send(bytes('new', 'utf-8'))
+        else:
+            print("No client connected,wait for client...")
+            continue
         # 拿新的data socket
         conn_client, addr = server_control.accept()  # 拿到代表client data传输的抽象代表
         print("Connected to client[data]", addr)
