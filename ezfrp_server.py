@@ -17,7 +17,6 @@ def handle_control():
         cmd = control_channel.recv(1024)
         # 处理控制消息
         print(cmd.decode('utf-8'))
-        # 这里也要两个线程分别完成收消息和发消息？
 
 
 def handle_public():
@@ -30,18 +29,27 @@ def handle_public():
         # 此时新的用户连接进来了，我们才需要向client发送new指令，然后再拿到代表data socket的抽象代表
         control_channel.send(bytes('new', 'utf-8'))
         # 拿新的data socket
-        # control_channel.accept() 这个可以么？
         conn_client, addr = server_control.accept()  # 拿到代表client data传输的抽象代表
         print("Connected to client[data]", addr)
+
+        def data_trans(socketA: socket.socket, socketB: socket.socket):
+            try:
+                while True:
+                    data = socketA.recv(1024)
+                    if not data:
+                        socketB.close()
+                        break
+                    socketB.send(data)
+            except (ConnectionResetError, OSError):
+                pass
+            finally:
+                socketA.close()
+                socketB.close()
         # 再新开2个子线程做数据转发，每个子线程只负责单向转发，这样一旦有数据就会发走，就完成了双向转发
         threading.Thread(target=data_trans, args=(conn_user, conn_client)).start()
         threading.Thread(target=data_trans, args=(conn_client, conn_user)).start()
 
 
-def data_trans(socketA: socket.socket, socketB: socket.socket):
-    while True:
-        data = socketA.recv(1024)
-        socketB.send(data)
 
 
 server_control = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
