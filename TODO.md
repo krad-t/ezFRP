@@ -33,7 +33,10 @@
 - [ ] Docker 部署（Dockerfile + docker-compose.yml）
 - [ ] Server 一键部署到 VPS
 
+## v0.8.0
+- [ ] Client 端可视化界面
+- [ ] Server 端 Web Dashboard
+
 ## 远期（可选）
 - [ ] 控制通道心跳/重连
 - [ ] C++ 数据转发热路径
-- [ ] 简单 Web Dashboard
