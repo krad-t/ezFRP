@@ -6,24 +6,30 @@ from protocol import *
 
 class Server:
     def __init__(self):
+        self.sockets = []
         self.server_control = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_control.bind(("0.0.0.0", CONTROL_PORT))
         self.server_control.listen(1)
+        self.sockets.append(self.server_control)
         self.server_client_udp_data = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.server_client_udp_data.bind(("0.0.0.0", UDP_DATA_PORT))
-
+        self.sockets.append(self.server_client_udp_data)
         threading.Thread(target=self.handle_control, daemon=True).start()
 
         self.server_public_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_public_tcp.bind(("0.0.0.0", PUBLIC_PORT_TCP))
         self.server_public_tcp.listen(1)
+        self.sockets.append(self.server_public_tcp)
 
         self.server_public_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.server_public_udp.bind(("0.0.0.0", PUBLIC_PORT_UDP))
+        self.sockets.append(self.server_public_udp)
 
         self.addr2sid_map = dict()  # 维护一个反向映射表，key是用户地址，value是session_id
         self.sid2addr_map = dict() # 维护一个会话映射表，key是session_id，value是用户地址
         self.session_sequence = 0  # 维护一个全局会话序列号，每当有新的用户连接进来时，就自增1，生成一个新的session_id
+
+
 
         print("Server initialized")
 
@@ -32,6 +38,7 @@ class Server:
         # control_channel 专门用来处理控制消息
         while True:
             control_channel, addr = self.server_control.accept()
+            self.sockets.append(control_channel)
             # todo:v0.6.0
             print(f"Connected by client[control]:{addr}")
             while True:
@@ -54,7 +61,7 @@ class Server:
         def user2client(client_addr):
             while True:
                 data_user, addr_user = self.server_public_udp.recvfrom(4096)
-
+                print(f"Data [{data_user}] from {addr_user}")
                 if addr_user not in self.addr2sid_map: # 如果这个用户之前没有连接过，那么就给他分配一个新的session_id
                     self.session_sequence += 1
                     session_id = self.session_sequence
@@ -69,17 +76,17 @@ class Server:
 
         def client2user():
             while True:
-                data_client, addr = self.server_client_udp_data.recvfrom(4096)
+                data_client, _ = self.server_client_udp_data.recvfrom(4096)
                 session_id = struct.unpack("!I", data_client[:4])[0]
                 data_client = data_client[4:]
-                if session_id in self.sid2addr_map: # 如果这个session_id存在，那么就拿到对应的用户地址，转发给用户
-                    user_addr = self.sid2addr_map[session_id]
-                    self.server_public_udp.sendto(data_client, user_addr)
+                if session_id != -1: # UDP 打洞的包，忽略
+                    if session_id in self.sid2addr_map: # 如果这个session_id存在，那么就拿到对应的用户地址，转发给用户
+                        user_addr = self.sid2addr_map[session_id]
+                        self.server_public_udp.sendto(data_client, user_addr)
 
-        client_port_udp = control_channel.recv(1024) # 等待client回复自己的udp地址
-        client_port_udp = client_port_udp.decode('utf-8')
-        client_addr_udp = (control_channel.getsockname()[0], int(client_port_udp)) # 拼出client的udp地址
-        print(f"Client's UDP addr is {control_channel.getsockname()[0]}:{client_port_udp}")
+        client_port_udp = control_channel.recv(1024).decode('utf-8') # 等待client回复自己的udp地址
+        client_addr_udp = (control_channel.getpeername()[0], int(client_port_udp)) # 拼出client的udp地址
+        print(f"Client's UDP addr is {control_channel.getpeername()[0]}:{client_port_udp}")
 
         # 双向转发
         threading.Thread(target=user2client, args=(client_addr_udp,)).start()
@@ -104,6 +111,7 @@ class Server:
 
         while True:
             conn_user, addr = self.server_public_tcp.accept()
+            self.sockets.append(conn_user)
             print("Connected to public[outerUser]", addr)
             # 此时新的用户连接进来了，我们才需要向client发送new指令，然后再拿到代表data socket的抽象代表
             if control_channel is not None:
@@ -115,6 +123,7 @@ class Server:
                 continue
             # 拿新的data socket
             conn_client, addr = self.server_control.accept()  # 拿到代表client data传输的抽象代表
+            self.sockets.append(conn_client)
             print("Connected to client[data]", addr)
 
             # 再新开2个子线程做数据转发，每个子线程只负责单向转发，这样一旦有数据就会发走，就完成了双向转发
@@ -127,4 +136,6 @@ if __name__ == '__main__':
     while True:
         cli_cmd = input("q to quit:")
         if cli_cmd == 'q':
+            for s in server.sockets:
+                s.close()
             break

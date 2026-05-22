@@ -30,8 +30,8 @@ class Client:
                 self.server_control.send(bytes('UDP',"utf-8"))
                 client_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 client_sock.bind(("0.0.0.0", 0)) # 绑定一个随机端口
-                parts = [x.strip() for x in str(client_sock.getsockname()).strip("()").split(",")]
-                self.server_control.send(bytes(parts[1]), "utf-8") # 把这个随机端口发给server，让server知道往哪个端口发UDP数据
+                print(f"client socket bound to {client_sock.getsockname()}")
+                self.server_control.send(bytes(str(client_sock.getsockname()[1]).encode("utf-8"))) # 把这个随机端口发给server，让server知道往哪个端口发UDP数据
                 # threading.Thread(target=self.handle_control_udp, args=(client_sock,)).start()
                 self.handle_control_udp(client_sock)
                 break
@@ -49,6 +49,7 @@ class Client:
             while True:
                 client_data, _ = client_socket.recvfrom(4096)
                 sid = struct.unpack("!I", client_data[:4])[0]
+                print(f"client data: {client_data}")
                 client_data = client_data[4:]
                 if sid not in self.sid2sock_map: # 如果这个session_id之前没有连接过，那么就给他分配一个新的socket
                     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -60,6 +61,8 @@ class Client:
                 sock = self.sid2sock_map[sid]
                 sock.sendto(client_data, ("127.0.0.1", 25565)) # 转发给本地服务
 
+        data = struct.pack("!I", -1)
+        client_socket.sendto(data, (SERVER_IP, UDP_DATA_PORT)) # NAT 打洞
         threading.Thread(target=client2local).start()
 
     def handle_control_tcp(self):

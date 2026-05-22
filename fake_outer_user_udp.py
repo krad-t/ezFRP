@@ -2,6 +2,7 @@ import socket
 from protocol import SERVER_IP,PUBLIC_PORT_UDP
 
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("0.0.0.0", 0)) # 绑定一个随机端口
 while True:
     data = input(f"input anything(q to quit){s.getsockname()}:")
     if data == 'q':
