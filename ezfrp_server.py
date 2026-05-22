@@ -79,7 +79,9 @@ class Server:
         client_addr_udp, _ = control_channel.recv(1024) # 等待client回复自己的udp地址
         client_addr_udp = client_addr_udp.decode('utf-8')
         print(f"Client's UDP address is {client_addr_udp}")
-        client_addr_udp = eval(client_addr_udp) # 把字符串形式的地址转换成元组形式
+        # belike client_addr_udp = "('192.168.1.100', 8888)"
+        parts = [x.strip().strip("'") for x in client_addr_udp.strip("()").split(",")]
+        client_addr_udp = (parts[0], int(parts[1]))
 
         # 双向转发
         threading.Thread(target=user2client, args=(client_addr_udp,)).start()
