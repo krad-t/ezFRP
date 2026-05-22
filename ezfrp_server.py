@@ -76,12 +76,10 @@ class Server:
                     user_addr = self.sid2addr_map[session_id]
                     self.server_public_udp.sendto(data_client, user_addr)
 
-        client_addr_udp, _ = control_channel.recv(1024) # 等待client回复自己的udp地址
-        client_addr_udp = client_addr_udp.decode('utf-8')
-        print(f"Client's UDP address is {client_addr_udp}")
-        # belike client_addr_udp = "('192.168.1.100', 8888)"
-        parts = [x.strip().strip("'") for x in client_addr_udp.strip("()").split(",")]
-        client_addr_udp = (parts[0], int(parts[1]))
+        client_port_udp = control_channel.recv(1024) # 等待client回复自己的udp地址
+        client_port_udp = client_port_udp.decode('utf-8')
+        client_addr_udp = (control_channel.getsockname()[0], int(client_port_udp)) # 拼出client的udp地址
+        print(f"Client's UDP addr is {control_channel.getsockname()[0]}:{client_port_udp}")
 
         # 双向转发
         threading.Thread(target=user2client, args=(client_addr_udp,)).start()

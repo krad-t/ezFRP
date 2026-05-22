@@ -30,7 +30,8 @@ class Client:
                 self.server_control.send(bytes('UDP',"utf-8"))
                 client_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 client_sock.bind(("0.0.0.0", 0)) # 绑定一个随机端口
-                self.server_control.send(bytes(str(client_sock.getsockname()), "utf-8")) # 把这个随机端口发给server，让server知道往哪个端口发UDP数据
+                parts = [x.strip() for x in str(client_sock.getsockname()).strip("()").split(",")]
+                self.server_control.send(bytes(parts[1]), "utf-8") # 把这个随机端口发给server，让server知道往哪个端口发UDP数据
                 # threading.Thread(target=self.handle_control_udp, args=(client_sock,)).start()
                 self.handle_control_udp(client_sock)
                 break
