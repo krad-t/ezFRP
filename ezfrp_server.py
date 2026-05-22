@@ -86,7 +86,15 @@ class Server:
 
         client_port_udp = control_channel.recv(1024).decode('utf-8') # 等待client回复自己的udp地址
         client_addr_udp = (control_channel.getpeername()[0], int(client_port_udp)) # 拼出client的udp地址
-        print(f"Client's UDP addr is {control_channel.getpeername()[0]}:{client_port_udp}")
+        # 若client 处于 NAT 设备之后，则这个端口就是错误的，需要靠UDP打洞来获取正确的地址
+        control_channel.send(bytes("UDP_HOLE_PUNCHING", "utf-8")) # 发送打洞指令给client，让client发送一个UDP包过来
+        _, addr = self.server_client_udp_data.recvfrom(4096) # 从client发过来的UDP包中获取打洞后的端口
+        client_port_udp_nat = addr[1]
+
+        print(f"Client's UDP addr is                   {control_channel.getpeername()[0]}")
+        print(f"Client's UDP port in LAN is            {client_port_udp}")
+        print(f"Client's UDP port by mapping in NAT is {client_port_udp_nat}")
+        print(f"The Client is after NAT: {client_port_udp != client_port_udp_nat}")
 
         # 双向转发
         threading.Thread(target=user2client, args=(client_addr_udp,)).start()

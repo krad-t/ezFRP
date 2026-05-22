@@ -30,8 +30,7 @@ class Client:
                 self.server_control.send(bytes('UDP',"utf-8"))
                 client_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 client_sock.bind(("0.0.0.0", 0)) # 绑定一个随机端口
-                print(f"client socket bound to {client_sock.getsockname()}")
-                self.server_control.send(bytes(str(client_sock.getsockname()[1]).encode("utf-8"))) # 把这个随机端口发给server，让server知道往哪个端口发UDP数据
+                
                 # threading.Thread(target=self.handle_control_udp, args=(client_sock,)).start()
                 self.handle_control_udp(client_sock)
                 break
@@ -60,9 +59,14 @@ class Client:
                 
                 sock = self.sid2sock_map[sid]
                 sock.sendto(client_data, ("127.0.0.1", 25565)) # 转发给本地服务
-
-        data = struct.pack("!I", -1)
-        client_socket.sendto(data, (SERVER_IP, UDP_DATA_PORT)) # NAT 打洞
+        
+        print(f"client socket bound to {client_socket.getsockname()}")
+        self.server_control.send(bytes(str(client_socket.getsockname()[1]).encode("utf-8"))) # 把这个随机端口发给server，让server知道往哪个端口发UDP数据
+        # 但是如果Client处于NAT设备之后，那么这个端口不等于NAT设备映射出来的端口，所以还需要UDP打洞来获取正确的地址
+        cmd = self.server_control.recv(1024) # 等待接收Server打洞的指令，这时候Client就可以发送一个UDP包过去，让Server判断收到的UDP包是否和通过server_control发过来的端口一致，从而确认Client的网络拓扑
+        if cmd.decode("utf-8") == "UDP_HOLE_PUNCHING":
+            data = struct.pack("!I", -1)
+            client_socket.sendto(data, (SERVER_IP, UDP_DATA_PORT)) # NAT 打洞
         threading.Thread(target=client2local).start()
 
     def handle_control_tcp(self):
