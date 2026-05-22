@@ -1,8 +1,9 @@
 from datetime import datetime
 import socket
+import struct
 import threading
 
-from protocol import SERVER_IP,CONTROL_PORT
+from protocol import SERVER_IP,CONTROL_PORT,UDP_DATA_PORT
 
 
 class Client:
@@ -11,6 +12,9 @@ class Client:
         self.server_control.connect((SERVER_IP, CONTROL_PORT))
         self.control_thread = threading.Thread(target=self.handle_control, daemon=True)
         self.control_thread.start()
+
+        self.sid2sock_map = dict()  # 维护一个socket映射表，key是来自服务端UDP包的session_id，value是本地的的socket对象实例
+        self.sock2sid_map = dict() # 维护一个反向映射表，key是本地的socket对象实例，value是来自session_id
 
 
     def handle_control(self):
@@ -24,27 +28,38 @@ class Client:
                 break
             elif choice == '2':
                 self.server_control.send(bytes('UDP',"utf-8"))
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.bind(("127.0.0.1", 25565))
-                threading.Thread(target=self.handle_control_udp, args=(sock,)).start()
+                client_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                client_sock.bind(("0.0.0.0", 0)) # 绑定一个随机端口
+                self.server_control.send(bytes(str(client_sock.getsockname()), "utf-8")) # 把这个随机端口发给server，让server知道往哪个端口发UDP数据
+                # threading.Thread(target=self.handle_control_udp, args=(client_sock,)).start()
+                self.handle_control_udp(client_sock)
                 break
 
 
-    def handle_control_udp(self, local_socket: socket.socket):
+    def handle_control_udp(self, client_socket: socket.socket):
         # udp
-        def local2client():
+        def local2client(socket_in_map: socket.socket):
             while True:
-                data_user, addr_user = self.server_public_udp.recvfrom(4096)
-                self.server_client_udp_data.sendto(data_user, addr_user)
-                # self.session_map[udpid] = addr_user
+                data_local, _ = socket_in_map.recvfrom(4096)
+                data_local = struct.pack("!I", self.sid2sock_map[socket_in_map]) + data_local
+                client_socket.sendto(data_local, (SERVER_IP, UDP_DATA_PORT)) # 转发给server的UDP数据端口
 
         def client2local():
             while True:
-                data_client, addr_client = self.server_client_udp_data.recvfrom(4096)
-                self.server_public_udp.sendto(data_client, addr_client)
-                # self.session_map[udpid] = addr_client
+                client_data, _ = client_socket.recvfrom(4096)
+                sid = struct.unpack("!I", client_data[:4])[0]
+                client_data = client_data[4:]
+                if sid not in self.sid2sock_map: # 如果这个session_id之前没有连接过，那么就给他分配一个新的socket
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    sock.bind(("127.0.0.1", 0)) # 绑定一个随机端口
+                    self.sid2sock_map[sid] = sock
+                    self.sock2sid_map[sock] = sid
+                    threading.Thread(target=local2client, args=(sock,)).start() # 每个socket都要单独开一个线程来监听本地服务的响应数据，并转发给client
+                
+                sock = self.sid2sock_map[sid]
+                sock.sendto(client_data, ("127.0.0.1", 25565)) # 转发给本地服务
 
-        threading
+        threading.Thread(target=client2local).start()
 
     def handle_control_tcp(self):
         # tcp

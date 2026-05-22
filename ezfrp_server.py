@@ -1,5 +1,6 @@
 import threading
 import socket
+import struct
 from protocol import *
 
 
@@ -20,7 +21,9 @@ class Server:
         self.server_public_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.server_public_udp.bind(("0.0.0.0", PUBLIC_PORT_UDP))
 
-        self.session_map = dict()
+        self.addr2sid_map = dict()  # 维护一个反向映射表，key是用户地址，value是session_id
+        self.sid2addr_map = dict() # 维护一个会话映射表，key是session_id，value是用户地址
+        self.session_sequence = 0  # 维护一个全局会话序列号，每当有新的用户连接进来时，就自增1，生成一个新的session_id
 
         print("Server initialized")
 
@@ -48,20 +51,38 @@ class Server:
 
     def handle_public_udp(self, control_channel: socket.socket):
         # 监听 :9998，处理外部用户连接
-        def user2client():
+        def user2client(client_addr):
             while True:
                 data_user, addr_user = self.server_public_udp.recvfrom(4096)
-                self.server_client_udp_data.sendto(data_user, addr_user)
-                # self.session_map[udpid] = addr_user
+
+                if addr_user not in self.addr2sid_map: # 如果这个用户之前没有连接过，那么就给他分配一个新的session_id
+                    self.session_sequence += 1
+                    session_id = self.session_sequence
+                    self.addr2sid_map[addr_user] = session_id # 建立用户地址到session_id的映射
+                else: # 如果这个用户之前连接过，那么就复用之前的session_id
+                    session_id = self.addr2sid_map[addr_user]
+
+                self.sid2addr_map[session_id] = addr_user # 建立session_id到用户地址的映射
+
+                data_user = struct.pack("!I", session_id) + data_user
+                self.server_client_udp_data.sendto(data_user, client_addr)
 
         def client2user():
             while True:
-                data_client, addr_client = self.server_client_udp_data.recvfrom(4096)
-                self.server_public_udp.sendto(data_client, addr_client)
-                # self.session_map[udpid] = addr_client
+                data_client, addr = self.server_client_udp_data.recvfrom(4096)
+                session_id = struct.unpack("!I", data_client[:4])[0]
+                data_client = data_client[4:]
+                if session_id in self.sid2addr_map: # 如果这个session_id存在，那么就拿到对应的用户地址，转发给用户
+                    user_addr = self.sid2addr_map[session_id]
+                    self.server_public_udp.sendto(data_client, user_addr)
+
+        client_addr_udp, _ = control_channel.recv(1024) # 等待client回复自己的udp地址
+        client_addr_udp = client_addr_udp.decode('utf-8')
+        print(f"Client's UDP address is {client_addr_udp}")
+        client_addr_udp = eval(client_addr_udp) # 把字符串形式的地址转换成元组形式
 
         # 双向转发
-        threading.Thread(target=user2client).start()
+        threading.Thread(target=user2client, args=(client_addr_udp,)).start()
         threading.Thread(target=client2user).start()
 
 
