@@ -20,20 +20,31 @@ class Client:
             if choice == '1':
                 self.server_control.send(bytes('TCP',"utf-8"))
                 # daemon继承
-                t1 = threading.Thread(target=self.handle_control_tcp)
-                t1.start()
+                threading.Thread(target=self.handle_control_tcp).start()
                 break
             elif choice == '2':
                 self.server_control.send(bytes('UDP',"utf-8"))
-                t1 = threading.Thread(target=self.handle_control_udp)
-                t1.start()
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.bind(("127.0.0.1", 25565))
+                threading.Thread(target=self.handle_control_udp, args=(sock,)).start()
                 break
 
 
-    def handle_control_udp(self):
+    def handle_control_udp(self, local_socket: socket.socket):
         # udp
-        while True:
-            pass
+        def local2client():
+            while True:
+                data_user, addr_user = self.server_public_udp.recvfrom(4096)
+                self.server_client_udp_data.sendto(data_user, addr_user)
+                # self.session_map[udpid] = addr_user
+
+        def client2local():
+            while True:
+                data_client, addr_client = self.server_client_udp_data.recvfrom(4096)
+                self.server_public_udp.sendto(data_client, addr_client)
+                # self.session_map[udpid] = addr_client
+
+        threading
 
     def handle_control_tcp(self):
         # tcp
