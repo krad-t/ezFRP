@@ -41,7 +41,7 @@ class Client:
         def local2client(socket_in_map: socket.socket):
             while True:
                 data_local, _ = socket_in_map.recvfrom(4096)
-                data_local = struct.pack("!I", self.sid2sock_map[socket_in_map]) + data_local
+                data_local = struct.pack("!I", self.sock2sid_map[socket_in_map]) + data_local
                 client_socket.sendto(data_local, (SERVER_IP, UDP_DATA_PORT)) # 转发给server的UDP数据端口
 
         def client2local():
