@@ -79,7 +79,7 @@ class Server:
                 data_client, _ = self.server_client_udp_data.recvfrom(4096)
                 session_id = struct.unpack("!I", data_client[:4])[0]
                 data_client = data_client[4:]
-                if session_id != -1: # UDP 打洞的包，忽略
+                if session_id != 0: # UDP 打洞的包，忽略
                     if session_id in self.sid2addr_map: # 如果这个session_id存在，那么就拿到对应的用户地址，转发给用户
                         user_addr = self.sid2addr_map[session_id]
                         self.server_public_udp.sendto(data_client, user_addr)
@@ -89,8 +89,8 @@ class Server:
         # 若client 处于 NAT 设备之后，则这个端口就是错误的，需要靠UDP打洞来获取正确的地址
         control_channel.send(bytes("UDP_HOLE_PUNCHING", "utf-8")) # 发送打洞指令给client，让client发送一个UDP包过来
         _, addr = self.server_client_udp_data.recvfrom(4096) # 从client发过来的UDP包中获取打洞后的端口
-        client_port_udp_nat = addr[1]
-
+        client_port_udp_nat = addr[1] if addr[1] != client_addr_udp[1] else client_addr_udp[1]
+        client_addr_udp = (control_channel.getpeername()[0], int(client_port_udp_nat))
         print(f"Client's UDP addr is                   {control_channel.getpeername()[0]}")
         print(f"Client's UDP port in LAN is            {client_port_udp}")
         print(f"Client's UDP port by mapping in NAT is {client_port_udp_nat}")
