@@ -1,37 +1,56 @@
 import threading
 import socket
 import struct
-from protocol import *
 
 
 class Server:
     def __init__(self):
+        config = self.configure()
         self.sockets = []
         self.server_control = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_control.bind(("0.0.0.0", CONTROL_PORT))
+        self.server_control.bind(("0.0.0.0", config['control_port']))
         self.server_control.listen(1)
         self.sockets.append(self.server_control)
         self.server_client_udp_data = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.server_client_udp_data.bind(("0.0.0.0", UDP_DATA_PORT))
+        self.server_client_udp_data.bind(("0.0.0.0", config['udp_data_port']))
         self.sockets.append(self.server_client_udp_data)
         threading.Thread(target=self.handle_control, daemon=True).start()
 
         self.server_public_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_public_tcp.bind(("0.0.0.0", PUBLIC_PORT_TCP))
+        self.server_public_tcp.bind(("0.0.0.0", config['public_tcp_port']))
         self.server_public_tcp.listen(1)
         self.sockets.append(self.server_public_tcp)
 
         self.server_public_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.server_public_udp.bind(("0.0.0.0", PUBLIC_PORT_UDP))
+        self.server_public_udp.bind(("0.0.0.0", config['public_udp_port']))
         self.sockets.append(self.server_public_udp)
 
         self.addr2sid_map = dict()  # 维护一个反向映射表，key是用户地址，value是session_id
         self.sid2addr_map = dict() # 维护一个会话映射表，key是session_id，value是用户地址
         self.session_sequence = 0  # 维护一个全局会话序列号，每当有新的用户连接进来时，就自增1，生成一个新的session_id
 
-
-
         print("Server initialized")
+
+    def quit(self):
+        for s in self.sockets:
+            s.close()
+
+    def configure(self):
+        import json
+        try:
+            with open('ezfrp_server.json', 'r') as f:
+                config = json.load(f)
+        except FileNotFoundError:
+            print('ezfrp_server.json not found, creating a new one using default configuration')
+            config = {
+                'control_port': 7000,
+                'public_tcp_port': 9999,
+                'public_udp_port': 9998,
+                'udp_data_port': 7001
+            }
+            with open('ezfrp_server.json', 'w') as f:
+                f.write(json.dumps(config))
+        return config
 
     def handle_control(self):
         # 监听 :7000，处理 Client 的控制消息
@@ -39,7 +58,6 @@ class Server:
         while True:
             control_channel, addr = self.server_control.accept()
             self.sockets.append(control_channel)
-            # todo:v0.6.0
             print(f"Connected by client[control]:{addr}")
             while True:
                 try:
@@ -138,12 +156,10 @@ class Server:
             threading.Thread(target=data_trans, args=(conn_user, conn_client)).start()
             threading.Thread(target=data_trans, args=(conn_client, conn_user)).start()
 
-
 if __name__ == '__main__':
     server = Server()
     while True:
         cli_cmd = input("q to quit:")
         if cli_cmd == 'q':
-            for s in server.sockets:
-                s.close()
+            server.quit()
             break

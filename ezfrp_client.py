@@ -3,22 +3,43 @@ import socket
 import struct
 import threading
 
-from protocol import SERVER_IP,CONTROL_PORT,UDP_DATA_PORT
 
 
 class Client:
     def __init__(self):
+        self.config = self.configure()
+        self.sockets = []
+
         self.server_control = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_control.connect((SERVER_IP, CONTROL_PORT))
+        self.server_control.connect((self.config['server_ip'], self.config['control_port']))
+        self.sockets.append(self.server_control)
         self.control_thread = threading.Thread(target=self.handle_control, daemon=True)
         self.control_thread.start()
+
 
         self.sid2sock_map = dict()  # 维护一个socket映射表，key是来自服务端UDP包的session_id，value是本地的的socket对象实例
         self.sock2sid_map = dict() # 维护一个反向映射表，key是本地的socket对象实例，value是来自session_id
 
+    def configure(self):
+        import json
+        try:
+            with open('ezfrp_client.json', 'r') as f:
+                config = json.load(f)
+        except FileNotFoundError:
+            print('ezfrp_client.json not found, creating a new one using default configuration')
+            config = {
+                "server_ip": "124.221.101.254",
+                "control_port": 7000,
+                "local_host": "127.0.0.1",
+                "local_port": 25565,
+                "udp_data_port":7001
+            }
+            with open('ezfrp_client.json', 'w') as f:
+                f.write(json.dumps(config))
+        return config
 
     def handle_control(self):
-        print("Successfully connected to server", SERVER_IP)
+        print("Successfully connected to server", self.config['server_ip'])
         while True:
             choice = input("Establishing TCP(1) or UDP(2) tunnel:")
             if choice == '1':
@@ -42,7 +63,7 @@ class Client:
             while True:
                 data_local, _ = socket_in_map.recvfrom(4096)
                 data_local = struct.pack("!I", self.sock2sid_map[socket_in_map]) + data_local
-                client_socket.sendto(data_local, (SERVER_IP, UDP_DATA_PORT)) # 转发给server的UDP数据端口
+                client_socket.sendto(data_local, (self.config['server_ip'], self.config['udp_data_port'])) # 转发给server的UDP数据端口
 
         def client2local():
             while True:
@@ -58,7 +79,7 @@ class Client:
                     threading.Thread(target=local2client, args=(sock,)).start() # 每个socket都要单独开一个线程来监听本地服务的响应数据，并转发给client
                 
                 sock = self.sid2sock_map[sid]
-                sock.sendto(client_data, ("127.0.0.1", 25565)) # 转发给本地服务
+                sock.sendto(client_data, (self.config['local_host'], self.config['local_port'])) # 转发给本地服务
         
         print(f"client socket bound to {client_socket.getsockname()}")
         self.server_control.send(bytes(str(client_socket.getsockname()[1]).encode("utf-8"))) # 把这个随机端口发给server，让server知道往哪个端口发UDP数据
@@ -67,7 +88,7 @@ class Client:
         print(f"client command received: {cmd}")
         if cmd == "UDP_HOLE_PUNCHING":
             data = struct.pack("!I", 0)
-            client_socket.sendto(data, (SERVER_IP, UDP_DATA_PORT)) # NAT 打洞
+            client_socket.sendto(data, (self.config['server_ip'], self.config['udp_data_port'])) # NAT 打洞
         threading.Thread(target=client2local).start()
 
     def handle_control_tcp(self):
@@ -80,12 +101,13 @@ class Client:
                 print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}:{cmd}")
                 # 这个server_data是新建立出来的,用于数据转发
                 server_data = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                server_data.connect((SERVER_IP, CONTROL_PORT))
+                server_data.connect((self.config['server_ip'], self.config['control_port']))
                 # 一对 [server_data --- local_data] ,local_data是本地的内存对象实例，server_data是另一侧Server端的抽象代表
-
+                self.sockets.append(server_data)
                 # 这个local_data是连接本地的软件（例如MC服务端）端口的，每个外部用户必须得配备一个新的Socket
                 local_data = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                local_data.connect(('127.0.0.1', 25565))
+                local_data.connect((self.config['local_host'], self.config['local_port']))
+                self.sockets.append(local_data)
 
                 def data_trans(socketA: socket.socket, socketB: socket.socket):
                     try:
@@ -107,6 +129,11 @@ class Client:
     def send_cmd(self, param):
         pass
 
+    def quit(self):
+        for s in self.sockets:
+            s.close()
+        for s in self.sock2sid_map:
+            s.close()
 
 if __name__ == '__main__':
     client = Client()
@@ -115,3 +142,4 @@ if __name__ == '__main__':
         cli_cmd = input("q to quit:")
         if cli_cmd == 'q':
             break
+

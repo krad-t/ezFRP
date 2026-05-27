@@ -17,10 +17,9 @@
 - [x] Server 维护外部用户地址映射表
 - [x] 模拟 UDP 应用测试（fake_udp_app）
 
-## v0.4.0
-- [ ] 配置文件支持（YAML/JSON），不再硬编码端口
-- [ ] Client 端可配置本地服务地址
-- [ ] 重构指令系统，从str封装
+## v0.4.0 - 进行中 feature/config-file
+- [x] 配置文件支持（YAML/JSON），不再硬编码端口
+- [x] Client 端可配置本地服务地址
 
 ## v0.5.0
 - [ ] Selector 技术替换 threading（I/O 多路复用）
