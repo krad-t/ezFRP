@@ -2,14 +2,15 @@ from datetime import datetime
 import socket
 import struct
 import threading
-
+import selectors
+from typing import cast
 
 
 class Client:
     def __init__(self):
         self.config = self.configure()
         self.sockets = []
-
+        self.sel = selectors.DefaultSelector()
         self.server_control = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_control.connect((self.config['server_ip'], self.config['control_port']))
         self.sockets.append(self.server_control)
@@ -93,38 +94,42 @@ class Client:
 
     def handle_control_tcp(self):
         # tcp
-        # 第一次是发送控制消息new，此消息表示"有新的外部用户连接了，client可以创建data socket了"
-        # 只接受一个new指令
+        # 第一次是发送控制消息new，此消息表示"有新的外部用户连接了，client可以创建data socket了" 只接受一个new指令
+        self.sel.register(self.server_control, selectors.EVENT_READ, data="NewUser")
         while True:
-            cmd = self.server_control.recv(1024).decode('utf-8')
-            if cmd == 'new':
-                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}:{cmd}")
-                # 这个server_data是新建立出来的,用于数据转发
-                server_data = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                server_data.connect((self.config['server_ip'], self.config['control_port']))
-                # 一对 [server_data --- local_data] ,local_data是本地的内存对象实例，server_data是另一侧Server端的抽象代表
-                self.sockets.append(server_data)
-                # 这个local_data是连接本地的软件（例如MC服务端）端口的，每个外部用户必须得配备一个新的Socket
-                local_data = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                local_data.connect((self.config['local_host'], self.config['local_port']))
-                self.sockets.append(local_data)
-
-                def data_trans(socketA: socket.socket, socketB: socket.socket):
+            events = self.sel.select()
+            for key, mask in events:
+                data = key.data
+                if data == 'NewUser':
+                    sock = cast(socket.socket, key.fileobj)
+                    cmd = sock.recv(1024).decode('utf-8')
+                    if cmd == 'new':
+                        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}:{cmd}")
+                        server_data = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        server_data.connect((self.config['server_ip'], self.config['control_port']))
+                        self.sockets.append(server_data)
+                        local_data = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        local_data.connect((self.config['local_host'], self.config['local_port']))
+                        self.sockets.append(local_data)
+                        self.sel.register(server_data, selectors.EVENT_READ, data=local_data)
+                        self.sel.register(local_data, selectors.EVENT_READ, data=server_data)
+                elif isinstance(data, socket.socket):
+                    sock_a = cast(socket.socket, key.fileobj)
+                    sock_b = key.data
                     try:
-                        while True:
-                            data = socketA.recv(1024)
-                            if not data:
-                                socketB.close()
-                                break
-                            socketB.send(data)
+                        recv_data = sock_a.recv(1024)
+                        if not recv_data:
+                            self.sel.unregister(sock_a)
+                            self.sel.unregister(sock_b)
+                            sock_a.close()
+                            sock_b.close()
+                        else:
+                            sock_b.send(recv_data)
                     except (ConnectionResetError, OSError):
-                        pass
-                    finally:
-                        socketA.close()
-                        socketB.close()
-
-                threading.Thread(target=data_trans, args=(server_data, local_data)).start()
-                threading.Thread(target=data_trans, args=(local_data, server_data)).start()
+                        self.sel.unregister(sock_a)
+                        self.sel.unregister(sock_b)
+                        sock_a.close()
+                        sock_b.close()
 
     def send_cmd(self, param):
         pass
