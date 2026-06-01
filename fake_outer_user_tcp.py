@@ -1,7 +1,15 @@
 import socket
-from protocol import SERVER_IP
+import json
+
+
+try:
+    with open('ezfrp_client.json', 'r') as f:
+        config = json.load(f)
+except FileNotFoundError:
+    print('json not found')
 
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+SERVER_IP = config['server_ip']
 s.connect((SERVER_IP,9999))
 while True:
     data = input(f"input anything(q to quit){s.getsockname()}:")

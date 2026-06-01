@@ -1,6 +1,21 @@
 import socket
-from protocol import SERVER_IP,PUBLIC_PORT_UDP
+import json
 
+
+try:
+    with open('ezfrp_client.json', 'r') as f:
+        config_client = json.load(f)
+except FileNotFoundError:
+    print('json not found')
+
+try:
+    with open('ezfrp_server.json', 'r') as f:
+        config_server = json.load(f)
+except FileNotFoundError:
+    print('json not found')
+
+SERVER_IP = config_client['server_ip']
+PUBLIC_PORT_UDP = config_server['public_udp_port']
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.bind(("0.0.0.0", 0)) # 绑定一个随机端口
 while True:
