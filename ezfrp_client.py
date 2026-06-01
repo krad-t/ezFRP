@@ -90,6 +90,17 @@ class Client:
         if cmd == "UDP_HOLE_PUNCHING":
             data = struct.pack("!I", 0)
             client_socket.sendto(data, (self.config['server_ip'], self.config['udp_data_port'])) # NAT 打洞
+
+
+        def keepalive():
+            import time
+            while True:
+                time.sleep(10)
+                data = struct.pack("!I", 0)
+                client_socket.sendto(data, (self.config['server_ip'], self.config['udp_data_port']))
+
+        threading.Thread(target=keepalive, daemon=True).start()
+
         threading.Thread(target=client2local).start()
 
     def handle_control_tcp(self):
