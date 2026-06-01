@@ -21,10 +21,10 @@
 - [x] 配置文件支持（YAML/JSON），不再硬编码端口
 - [x] Client 端可配置本地服务地址
 
-## v0.5.0 - 进行中 feature/selector
+## v0.5.0 ✅ 已完成
 - [ ] Selector 技术替换 threading（I/O 多路复用）
 
-## v0.6.0
+## v0.6.0 - 进行中 feature/multi-client
 - [ ] 多 Client 支持（Server 同时服务多个 Client）
 - [ ] 每 Client 独立公网端口 + 端口注册协议
 - [ ] Client 注册时声明"我需要服务端口 XXXX"
