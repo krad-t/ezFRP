@@ -85,11 +85,12 @@ class Server:
                     self._log(f"CMD [{client_cmd}] from {addr}")
                     # daemon继承
                     if client_cmd == 'TCP':
-                        # threading.Thread(target=self.handle_public_tcp, args=(control_channel,)).start()
                         self.handle_public_tcp(control_channel)
                     elif client_cmd == 'UDP':
-                        # threading.Thread(target=self.handle_public_udp, args=(control_channel,)).start()
                         self.handle_public_udp(control_channel)
+                    else:
+                        Server._log(self, f"Unknown command [{client_cmd}] from {addr}")
+                        break
                 except (ConnectionResetError, OSError):
                     self._log("Client disconnected, waiting for reconnect...")
                     break
