@@ -69,7 +69,6 @@ class Client:
                 self._ctl_listen.send(bytes('UDP', "utf-8"))
                 client_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 client_sock.bind(("0.0.0.0", 0)) # 绑定一个随机端口作为和Server转发UDP data的出入口
-                
                 # threading.Thread(target=self.handle_control_udp, args=(client_sock,)).start()
                 self.handle_control_udp(client_sock)
                 break
