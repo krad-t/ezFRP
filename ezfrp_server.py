@@ -3,61 +3,69 @@ import socket
 import struct
 import selectors
 from typing import cast
+from enum import IntEnum
 
 from protocol import *
+from ezfrp_service import *
 
+
+class Tag(IntEnum):
+    DSP_ACCEPT = 1  # _dispatch_listen 有新 TCP连接
+    UNK_RECV = 2   # 处理_dispatch_listen accept的未知sock
+    CTL_RECV = 3  # 已有 Client 的控制通道可读
+    TCP_ACCEPT = 4  # 某公网 TCP 端口有新外部用户
+    TCP_DATA = 5  # TCP socket pair 可读
+    UDP_PUBLIC = 6  # 公网 UDP 收到数据
+    UDP_CLIENT = 7  # Client 的 UDP 回复到达
 
 class Server:
-    @dataclass
-    class Service:
-        session_id: int
-        ctl: socket.socket
-        client_port: int
-        user_port: int
-        channel_type: ResponseType
-        addr2sid: dict
-        sid2addr: dict
-        client_addr: tuple
 
     def __init__(self):
         self.config = Server.configure()
         self._sockets = []
-        self._ctl_listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._ctl_listen.bind(("0.0.0.0", self.config['control_port']))
-        self._ctl_listen.listen(1)
-        self._sockets.append(self._ctl_listen)
+        self._dispatch_listen_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # todo修改config的字段名，以符合语义
+        self._dispatch_listen_tcp.bind(("0.0.0.0", self.config['control_port']))
+        self._dispatch_listen_tcp.listen(1)
+        self._sockets.append(self._dispatch_listen_tcp)
 
+        self._client_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._client_udp.bind(("0.0.0.0", self.config['udp_data_port']))
+        self._sockets.append(self._client_udp)
         self._sel = selectors.DefaultSelector()
 
-        self._services = dict()  # 记录不同的服务组，1个Client-n个User定义为一组"服务"
-
+        # 记录不同的服务组，1个Client-n个User的一种协议通道 定义为一组"服务"，和对外暴露的端口一一映射
+        self._services:dict[int, BaseService] = dict()  
         self._log("Server initialized")
         self.run()
 
     def run(self):
-        self._sel.register(self._ctl_listen, selectors.EVENT_READ, data=(Tag.CTL_ACCEPT,))
+        self._sel.register(self._dispatch_listen_tcp, selectors.EVENT_READ, data=(Tag.DSP_ACCEPT,))
         while True:
             events = self._sel.select()
             for key, mask in events:
                 sock = cast(socket.socket, key.fileobj)
-                data = key.data
+                tag = key.data[0]
+                args = key.data[1:]
                 if mask & selectors.EVENT_READ:
-                    if data[0] == Tag.CTL_ACCEPT:
-                        self._accept_client(sock)
-                    elif data[0] == Tag.CTL_RECV:
-                        self._handle_ctl_cmd(sock)
-                    elif data[0] == Tag.TCP_ACCEPT:
-                        self._tcp_accept_user(sock, data[1])
-                    elif data[0] == Tag.TCP_DATA:
-                        self._tcp_data_trans(sock, data[1])
-                    elif data[0] == Tag.UDP_PUBLIC:
-                        self._udp_data_u2c(sock, data[1])
-                    elif data[0] == Tag.UDP_CLIENT:
-                        self._udp_data_c2u(sock, data[1])
+                    if tag == Tag.DSP_ACCEPT:
+                        self._client_dispatch_acc(sock, *args)
+                    elif tag == Tag.UNK_RECV:
+                        self._client_handle_unk(sock, *args)
+                    elif tag == Tag.CTL_RECV:
+                        self._handle_ctl_cmd(sock, *args)
+                    elif tag == Tag.TCP_ACCEPT:
+                        self._tcp_accept_user(sock, *args)
+                    elif tag == Tag.TCP_DATA:
+                        self._tcp_data_trans(sock, *args)
+                    elif tag == Tag.UDP_PUBLIC:
+                        self._udp_data_u2c(sock, *args)
+                    elif tag == Tag.UDP_CLIENT:
+                        self._udp_data_c2u(sock, *args)
                     else:
-                        self._log(f"Unknown tag: {data}")
+                        self._log(f"Unknown tag: {tag}")
 
-    def _register_services(self, ctl_channel: socket.socket, channel_type):
+    def _assign_service_ports(self, service:BaseService) -> tuple[int, int]:
         # 从合法的port pool中占用一个
         # todo:换成占用池子里的port
         # self.config["max_port"]
@@ -65,31 +73,14 @@ class Server:
         # ...
         public_port, client_port = 7000, 7001
 
-        if channel_type == ResponseType.UDP:
-            udp_service = Server.Service(
-                session_id=0,
-                ctl=ctl_channel,
-                client_port=client_port,
-                user_port=public_port,
-                channel_type=channel_type,
-                addr2sid={},
-                sid2addr={},
-                client_addr=(),
-            )
-            self._services[ctl_channel] = udp_service
-        elif channel_type == ResponseType.TCP:
-            self._services[ctl_channel] = Server.Service(
-                session_id=0,
-                ctl=ctl_channel,
-                client_port=client_port,
-                user_port=public_port,
-                channel_type=channel_type,
-                addr2sid={},
-                sid2addr={},
-                client_addr=(),
-            )
+        if service.channel_type == ResponseType.UDP:
+            pass
+        elif service.channel_type == ResponseType.TCP:
+            pass
         else:
-            self._log(f"Unknown channel type when gene service: {channel_type}")
+            self._log(f"Unknown channel type when assign service ports: {service.channel_type}")
+
+        service.user_port = public_port
         return public_port, client_port
 
     def quit(self):
@@ -124,58 +115,100 @@ class Server:
         return struct.pack(method, sid) + data
 
     @staticmethod
-    def unpack_udp(data: bytes, method="!I") -> (int, bytes):
+    def unpack_udp(data: bytes, method="!I") -> tuple[int, bytes]:
         session_id = struct.unpack(method, data[:4])[0]
         packet_data = data[4:]
         return session_id, packet_data
 
-    def _accept_client(self, sock: socket.socket):
-        # _ctl_listen 有新 Client 此时sock == _ctl_listen
-        ctl_channel, _ = sock.accept()
-        self._sel.register(ctl_channel, selectors.EVENT_READ, data=(Tag.CTL_RECV,))
-        self._log(f"Connected to client: {ctl_channel}")
+    def _client_dispatch_acc(self, dispatch_listen: socket.socket):
+        # _dispatch_listen 有新 Client 此时sock == _dispatch_listen
+        unknown_channel, _ = dispatch_listen.accept()
+        self._sel.register(unknown_channel, selectors.EVENT_READ, data=(Tag.UNK_RECV,))
+        self._log(f"Connected to client: {unknown_channel}")
+
+    def _client_handle_unk(self, unknown_channel: socket.socket):
+        raw_data, addr = unknown_channel.recv(1024)
+        # 解析data的指令
+        response_type, cmd_instance = Protocol.unpack(raw_data)
+        # 如果是CLIENT_LOGIN，这表示Client第一次连接Server
+        if response_type == ResponseType.CLIENT_LOGIN:
+            # 说明这是一个控制通道，注册为CTL_RECV
+            # todo 不传unknown_channel引用？
+            unknown_channel.send(Protocol.pack(cmd=LoginCompleteCommand(service_ctl=unknown_channel)))
+            self._sel.register(unknown_channel, selectors.EVENT_READ, data=(Tag.CTL_RECV,))
+        elif response_type == ResponseType.SERVICE_BIND:
+            # todo说明这是一个绑定服务的请求, 似乎只有TCP会从此绑定
+            cmd_instance = cast(RegisterCommand, cmd_instance)
+            sid = cmd_instance.service_id
+            service = self._services[sid]
+            cast(TCPService, service).curr_free_client_data_channel = unknown_channel
+            # 不需要注册，因为要在_tcp_accept_user里注册这个连接和公网用户的连接为TCP_DATA
+            # self._sel.register(unknown_channel, selectors.EVENT_READ, data=(Tag.TCP_DATA,sid))
+            
+        
 
     def _handle_ctl_cmd(self, ctl_channel: socket.socket):
         # 已有 Client 的控制通道可读
-        cmd = Protocol.parse_cmd_from_client(ctl_channel.recv(1024))
-        if cmd["response"] == ResponseType.REGISTER:
-            if cmd["channel_type"] == ResponseType.TCP:
-                public_port, _ = self._register_services(ctl_channel, ResponseType.TCP)
-                tcp_public_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                tcp_public_sock.bind(("0.0.0.0", public_port))
-                self._sel.register(tcp_public_sock, selectors.EVENT_READ, data=(Tag.TCP_ACCEPT, ctl_channel))
-                ctl_channel.send(Protocol.pack_cmd(response=ResponseType.OK, data=str(public_port)))
-            elif cmd["channel_type"] == ResponseType.UDP:
-                udp_public_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                public_port, client_port = self._register_services(ctl_channel, ResponseType.UDP)
-                udp_public_sock.bind(("0.0.0.0", public_port))
-                udp_client_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                udp_client_sock.bind(("0.0.0.0", client_port))
-                self._sel.register(udp_public_sock, selectors.EVENT_READ,
-                                   data=(Tag.UDP_PUBLIC, ctl_channel, udp_client_sock))
-                self._sel.register(udp_client_sock, selectors.EVENT_READ,
-                                   data=(Tag.UDP_CLIENT, ctl_channel, udp_public_sock))
-                ctl_channel.send(Protocol.pack_cmd(response=ResponseType.HOLE_PUNCHING, data=""))
-            else:
-                self._log(f"Unknown channel type: {cmd['channel_type']}")
-                return
-        elif cmd["response"] == ResponseType.HOLE_PUNCHING:
-            client_port = cmd["data"]
-            client_addr = (ctl_channel.getsockname()[0], client_port)
-            service = self._services[ctl_channel]
-            service.client_addr = client_addr
-            ctl_channel.send(Protocol.pack_cmd(response=ResponseType.OK, data=str(service.user_port)))
-        else:
-            self._log(f"Unknown command: {cmd['request']}:{cmd['channel_type']}")
+        raw_data, addr = ctl_channel.recv(1024)
+        response_type, cmd_instance = Protocol.unpack(raw_data)
+        if response_type == ResponseType.REGISTER:
+            # Client 发来注册数据通道的请求
+            # todo RegisterCommand和RegisterCompleteCommand 要做更精细的设计，以防上一个注册还没完成，Client就又发来一个注册请求了，导致回复的RegisterCompleteCommand和Client的RegisterCommand不匹配了
+            cmd_instance = cast(RegisterCommand, cmd_instance)
+            
+            if cmd_instance.get_cmd_type == ResponseType.UDP:
+                new_service = UDPService(
+                    ctl=ctl_channel,
+                    channel_type=ResponseType.UDP,
+                )
+                public_port, _ = self._assign_service_ports(new_service)
 
-    def _tcp_accept_user(self, public_sock, ctl_channel: socket.socket):
+                self._services[public_port] = new_service
+                new_service.ctl.send(Protocol.pack(cmd=RegisterCompleteCommand(public_port=public_port)))
+            elif cmd_instance.get_cmd_type == ResponseType.TCP:
+                public_listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                public_listen_sock.bind(("0.0.0.0", public_port))
+                public_listen_sock.listen(1)
+
+                new_service = TCPService(
+                    ctl=ctl_channel,
+                    channel_type=ResponseType.TCP,
+                    public_listen_sock=public_listen_sock
+                )
+                public_port, _ = self._assign_service_ports(new_service)
+                self._services[public_port] = new_service
+
+                self._sel.register(public_listen_sock, selectors.EVENT_READ, data=(Tag.TCP_ACCEPT, new_service))
+                new_service.ctl.send(Protocol.pack(cmd=RegisterCompleteCommand(public_port=public_port)))
+            else:
+                self._log(f"Unsupported channel type in REGISTER cmd: {cmd_instance.channel_type}")
+        elif response_type == ResponseType.HOLE_PUNCHING:
+            # Client 发来打洞命令，说明服务已经创建好了，获取地址即可
+            cmd_instance = cast(HolePunchingCommand, cmd_instance)
+            client_udp_addr = (ctl_channel.getsockname()[0], addr[1])
+            service = self._services[cmd_instance.public_port]
+            service.client_addr = client_udp_addr
+            client_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            client_sock.bind(("0.0.0.0", self.config['udp_data_port']))
+            public_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            public_port = cmd_instance.public_port
+            public_sock.bind(("0.0.0.0", public_port))
+            self._sel.register(public_sock, selectors.EVENT_READ, data=(Tag.UDP_PUBLIC, client_sock, service))
+            self._sel.register(client_sock, selectors.EVENT_READ, data=(Tag.UDP_CLIENT, public_sock, service))
+
+
+    def _tcp_accept_user(self, sock_listen, service: TCPService):
         # 某公网 TCP 端口有新外部用户
-        conn_user, addr_user = public_sock.accept()
-        ctl_channel.send(Protocol.pack_cmd(response=ResponseType.NEW_USER, data=""))
-        conn_client, addr_client = ctl_channel.accept()
+        conn_user, addr_user = sock_listen.accept()
+        conn_client = service.curr_free_client_data_channel
+        # 先使用掉空闲的连接
         self._sel.register(conn_user, selectors.EVENT_READ, data=(Tag.TCP_DATA, conn_client))
         self._sel.register(conn_client, selectors.EVENT_READ, data=(Tag.TCP_DATA, conn_user))
-        self._log(f"TCP pair registered: [U]{addr_user}<-->[C]{addr_client}")
+        # 再通知Client空闲的连接被新User占用，Client需要新建连接
+        service.curr_free_client_data_channel = None
+        service.ctl.send(Protocol.pack(cmd=NewUserCommand(public_port=service.public_port)))
+        self._log(f"TCP pair established: [U]{conn_user.getsockname()}<-->[C]{conn_client.getsockname()} for service on port {service.public_port}")
+
 
     def _tcp_data_trans(self, sock_a, sock_b):
         # TCP socket pair 可读
@@ -194,27 +227,24 @@ class Server:
             sock_a.close()
             sock_b.close()
 
-    def _udp_data_u2c(self, user_sock, ctl, client_sock: socket.socket):
-        # 公网 UDP 收到数据
+    def _udp_data_u2c(self, user_sock, client_sock: socket.socket, service: UDPService):
+        # 公网 UDP 收到数据,此时才能创建session，并通过_client_udp发送数据
         recv_data, addr = user_sock.recvfrom(2048)
-        # 先查找是属于哪个服务
-        service = self._services[ctl]
-        # 此时再查找session id
+        # 查找session id
         if addr not in service.addr2sid:
-            service.session_id += 1
-            service.addr2sid[addr] = service.session_id
-            sid = service.session_id
+            service.session_counter += 1
+            sid = service.session_counter
+            service.addr2sid[addr] = sid
+            service.sid2addr[sid] = addr
         else:
             sid = service.addr2sid[addr]
         packed_data = self.pack_udp(sid, recv_data)
         client_sock.sendto(packed_data, service.client_addr)
 
-    def _udp_data_c2u(self, client_sock, ctl, user_sock: socket.socket):
+    def _udp_data_c2u(self, client_sock, user_sock: socket.socket, service: UDPService):
         # Client 的 UDP 回复到达
         recv_data, addr = client_sock.recvfrom(2048)
-        # 查找服务
-        service = self._services[ctl]
-        # 再找session id
+        # 找session id
         sid, raw_data = self.unpack_udp(recv_data)
         user_sock.sendto(raw_data, service.sid2addr[sid])
 

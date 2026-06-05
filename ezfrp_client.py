@@ -50,7 +50,7 @@ class Client:
         return struct.pack(method, sid) + data
 
     @staticmethod
-    def unpack_udp(data: bytes, method="!I") -> (int, bytes):
+    def unpack_udp(data: bytes, method="!I") -> tuple[int, bytes]:
         session_id = struct.unpack(method, data[:4])[0]
         packet_data = data[4:]
         return session_id, packet_data
