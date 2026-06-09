@@ -1,5 +1,6 @@
 import struct
 import selectors
+import heapq
 from typing import cast
 from enum import IntEnum
 
@@ -18,22 +19,43 @@ class Tag(IntEnum):
 
 
 class Server:
+    class PortAllocator:
+        _data = []
+        _used = {}
+
+        def __init__(self, min_port, max_port):
+            for port in range(min_port, max_port + 1):
+                heapq.heappush(self._data, port)
+
+        def get_a_free_port(self) -> int:
+            port = heapq.heappop(self._data)
+            self._used[port] = True
+            return port
+
+        def free_a_port(self, port: int):
+            heapq.heappush(self._data, port)
+            self._used.pop(port, None)
+
+        def is_used(self, port: int) -> bool:
+            # todo 暂时未使用到此函数
+            return port in self._used
+
+    _portAllocator = None
 
     def __init__(self):
         self.config = Server.configure()
         self._sockets = []
         self._dispatch_listen_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # todo修改config的字段名，以符合语义
-        self._dispatch_listen_tcp.bind(("0.0.0.0", self.config['control_port']))
+        self._dispatch_listen_tcp.bind(("0.0.0.0", self.config['tcp_endpoint']))
         self._dispatch_listen_tcp.listen(1)
         self._sockets.append(self._dispatch_listen_tcp)
 
         self._client_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._client_udp.bind(("0.0.0.0", self.config['udp_data_port']))
+        self._client_udp.bind(("0.0.0.0", self.config['udp_endpoint']))
         self._sockets.append(self._client_udp)
         self._sel = selectors.DefaultSelector()
 
-        # 记录不同的服务组，1个Client-n个User的一种协议通道 定义为一组"服务"，服务和对外暴露的端口一一映射
+        # 记录不同的服务组，"1个Client-n个User的1种协议通道" 定义为一组"服务"，服务和对外暴露的端口一一映射
         self._services: dict[int, BaseService] = dict()
         self._log("Server initialized")
         self.run()
@@ -65,13 +87,12 @@ class Server:
                     else:
                         self._log(f"Unknown tag: {tag}")
 
-    def _assign_service_ports(self, service: BaseService) -> tuple[int, int]:
-        # 从合法的port pool中占用一个
-        # todo:换成占用池子里的port
-        # self.config["max_port"]
-        # self.config["min_port"]
-        # ...
-        public_port, client_port = 7000, 7001
+    def _assign_service_ports(self, service: BaseService) -> int:
+        if self._portAllocator is None:
+            self._portAllocator = Server.PortAllocator(min_port=self.config["min_port"],
+                                                       max_port=self.config["max_port"])
+
+        public_port = self._portAllocator.get_a_free_port()
 
         if service.channel_type == ResponseType.UDP:
             service.public_port = public_port
@@ -85,7 +106,7 @@ class Server:
         else:
             self._log(f"Unknown channel type when assign service ports: {service.channel_type}")
 
-        return public_port, client_port
+        return public_port
 
     def quit(self):
         for s in self._sockets:
@@ -105,35 +126,38 @@ class Server:
             print('ezfrp_server.json not found, creating a new one using default configuration')
             # todo修改默认的填充格式
             config = {
-                'control_port': 7000,
-                'public_tcp_port': 9999,
-                'public_udp_port': 9998,
-                'udp_data_port': 7001
+                "tcp_endpoint": 7000,
+                "udp_endpoint": 7001,
+                "max_port": 9999,
+                "min_port": 9900
             }
+
             with open('ezfrp_server.json', 'w') as f:
                 f.write(json.dumps(config))
         return config
 
     @staticmethod
-    def pack_udp(sid: int, data: bytes, method="!I") -> bytes:
-        return struct.pack(method, sid) + data
+    def pack_udp(sid: int, public_port: int, data: bytes, sid_fmt="!I", port_fmt="I") -> bytes:
+        return struct.pack(sid_fmt + port_fmt, sid, public_port) + data
 
     @staticmethod
-    def unpack_udp(data: bytes, method="!II") -> tuple[int, int, bytes]:
-        session_id, public_port = struct.unpack(method, data[:8])
-        packet_data = data[8:]
+    def unpack_udp(data: bytes, sid_fmt="!I", port_fmt="I") -> tuple[int, int, bytes]:
+        header_size = struct.calcsize(sid_fmt + port_fmt)
+        session_id, public_port = struct.unpack(sid_fmt + port_fmt, data[:header_size])
+        packet_data = data[header_size:]
         return session_id, public_port, packet_data
 
     def _client_dispatch_acc(self, dispatch_listen: socket.socket):
         # _dispatch_listen 有新 Client 此时sock == _dispatch_listen
         unknown_channel, _ = dispatch_listen.accept()
         self._sel.register(unknown_channel, selectors.EVENT_READ, data=(Tag.UNK_RECV,))
-        self._log(f"Connected to client: {unknown_channel}")
+        self._log(f"Connected to client: {unknown_channel.getpeername()}")
 
     def _client_handle_unk(self, unknown_channel: socket.socket):
         raw_data = unknown_channel.recv(1024)
         if not raw_data:
-            self._log(f"Client disconnected: {unknown_channel}")
+            self._log(f"Client disconnected: {unknown_channel.getpeername()}")
+            self._sel.unregister(unknown_channel)
             return
         # 解析data的指令
         response_type, cmd_instance = Protocol.unpack(raw_data)
@@ -159,7 +183,9 @@ class Server:
         # 已有 Client 的控制通道可读
         raw_data = ctl_channel.recv(1024)
         if not raw_data:
-            self._log(f"Client disconnected: {ctl_channel}")
+            self._log(f"Client disconnected: {ctl_channel.getpeername()}")
+            self._sel.unregister(ctl_channel)
+            return
         response_type, cmd_instance = Protocol.unpack(raw_data)
         if response_type == ResponseType.REGISTER:
             # Client 发来注册数据通道的请求
@@ -170,33 +196,38 @@ class Server:
                     ctl=ctl_channel,
                     channel_type=ResponseType.UDP,
                 )
-                public_port, _ = self._assign_service_ports(new_service)
+                public_port = self._assign_service_ports(new_service)
 
                 self._services[public_port] = new_service
-                new_service.ctl.send(Protocol.pack(cmd=RegisterCompleteCommand(public_port=public_port)))
+                new_service.ctl.send(Protocol.pack(
+                    cmd=RegisterCompleteCommand(public_port=public_port, channel_type=new_service.channel_type)))
             elif cmd_instance.channel_type == ResponseType.TCP:
                 new_service = TCPService(
                     ctl=ctl_channel,
                     channel_type=ResponseType.TCP
                 )
-                public_port, _ = self._assign_service_ports(new_service)
+                public_port = self._assign_service_ports(new_service)
                 self._services[public_port] = new_service
 
                 self._sel.register(new_service.public_listen_sock, selectors.EVENT_READ,
                                    data=(Tag.TCP_ACCEPT, new_service))
-                new_service.ctl.send(Protocol.pack(cmd=RegisterCompleteCommand(public_port=public_port)))
+                new_service.ctl.send(Protocol.pack(
+                    cmd=RegisterCompleteCommand(public_port=public_port, channel_type=new_service.channel_type)))
             else:
                 self._log(f"Unsupported channel type in REGISTER cmd: {cmd_instance.channel_type}")
-        elif response_type == ResponseType.HOLE_PUNCHING:
-            # Client 发来打洞命令，说明服务已经创建好了，获取地址即可
-            cmd_instance = cast(HolePunchingCommand, cmd_instance)
+        elif response_type == ResponseType.READY_HOLE_PUNCHING:
+            # Client 发来准备打洞命令，Server应该开启监听
+            cmd_instance = cast(ReadyHolePunchingCommand, cmd_instance)
             service = self._services[cmd_instance.public_port]
+            self._log(f"READY_HOLE_PUNCHING{cmd_instance.public_port}")
             public_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             public_port = cmd_instance.public_port
             public_sock.bind(("0.0.0.0", public_port))
+            ctl_channel.send(Protocol.pack(cmd=HolePunchingCommand(public_port)))
             self._sel.register(public_sock, selectors.EVENT_READ, data=(Tag.UDP_PUBLIC, self._client_udp, service))
         else:
             self._log(f'Unknown response type {response_type}')
+
     def _tcp_accept_user(self, sock_listen, service: TCPService):
         # 某公网 TCP 端口有新外部用户
         conn_user, addr_user = sock_listen.accept()
@@ -212,7 +243,7 @@ class Server:
         # 再通知Client空闲的连接被新User占用，Client需要补充新建连接
         service.ctl.send(Protocol.pack(cmd=NewUserCommand(public_port=service.public_port)))
 
-    def _tcp_data_trans(self, sock_a, sock_b):
+    def _tcp_data_trans(self, sock_a: socket.socket, sock_b: socket.socket):
         # TCP socket pair 可读
         try:
             recv_data = sock_a.recv(1024)
@@ -241,7 +272,7 @@ class Server:
             service.sid2usock[sid] = user_sock
         else:
             sid = service.addr2sid[addr]
-        packed_data = self.pack_udp(sid, recv_data)
+        packed_data = self.pack_udp(sid, service.public_port, recv_data)
         if service.client_addr is None:
             return
         client_sock.sendto(packed_data, service.client_addr)
@@ -258,7 +289,7 @@ class Server:
             # 打洞的包，只更新client_addr
             if service.client_addr is None:
                 service.client_addr = (service.ctl.getpeername()[0], addr[1])
-                service.ctl.send(Protocol.pack(cmd=HolePunchingCompleteCommand()))
+                service.ctl.send(Protocol.pack(cmd=HolePunchingCompleteCommand(public_port=public_port)))
             return
         else:
             user_sock = service.sid2usock[sid]

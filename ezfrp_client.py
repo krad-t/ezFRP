@@ -1,28 +1,181 @@
-import socket
 import struct
-import threading
 import selectors
+from enum import IntEnum
 from typing import cast
 
+from ezfrp_service import *
 from protocol import *
+
+
+class Tag(IntEnum):
+    LOGIN_SUCCESS = 1  # _dispatch_listen 有新 TCP连接
+    CTL_RECV = 2  # 控制通道收到消息
+    TCP_RECV = 3  # TCP pair 可读
+    UDP_SERVER = 4
+    UDP_LOCAL = 5
 
 
 class Client:
     def __init__(self):
         self._config = self.configure()
         self._sockets = []
-        self._tcp_sel = selectors.DefaultSelector()
-        self._udp_sel = selectors.DefaultSelector()
-        self._ctl_listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._ctl_listen.connect((self._config['server_ip'], self._config['control_port']))
-        self._sockets.append(self._ctl_listen)
-        self.control_thread = threading.Thread(target=self.handle_control, daemon=True)
-        self.control_thread.start()
+        self._sel = selectors.DefaultSelector()
+        self._ctl = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._udp_data_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._udp_data_sock.bind(("0.0.0.0", 0))
 
-        self._sid2sock = dict()  # 维护一个socket映射表，key是来自服务端UDP包的session_id，value是本地的的socket对象实例
-        self._sock2sid = dict() # 维护一个反向映射表，key是本地的socket对象实例，value是来自session_id
+        self._services: dict[int, BaseService] = dict()
+        self.run()
 
-    def _log(self, msg):
+    def run(self):
+        self._sel.register(self._ctl, selectors.EVENT_READ, data=(Tag.CTL_RECV,))
+        self._sel.register(self._udp_data_sock, selectors.EVENT_READ, data=(Tag.UDP_SERVER,))
+        self._ctl.connect((self._config['server_ip'], self._config['tcp_endpoint']))
+        self._log(f"Client connected to Server(1/2)")
+        self._ctl.send(Protocol.pack(cmd=ClientLoginCommand()))
+
+        while True:
+            events = self._sel.select()
+            for key, mask in events:
+                if mask & selectors.EVENT_READ:
+                    sock = cast(socket.socket, key.fileobj)
+                    tag = key.data[0]
+                    args = key.data[1:]
+                    if tag == Tag.CTL_RECV:
+                        self._handle_ctl(sock)
+                    elif tag == Tag.TCP_RECV:
+                        self._tcp_data_trans(sock, *args)
+                    elif tag == Tag.UDP_SERVER:
+                        self._udp_data_s2l(sock)
+                    elif tag == Tag.UDP_LOCAL:
+                        self._udp_data_l2s(sock, *args)
+
+    def _handle_ctl(self, ctl):
+        raw_data = ctl.recv(1024)
+        if not raw_data:
+            self._log("Client receive empty data when login, unknown error(2/2)")
+            self._sel.unregister(self._ctl)
+            return
+        response_type, cmd_instance = Protocol.unpack(raw_data)
+        if response_type == ResponseType.CLIENT_LOGIN_COMPLETE:
+            self._log("Client login complete(2/2)")
+
+            choice = "0"
+            while choice != 'q':
+                choice = input("input to choose channel,TCP(1),UDP(2) or quit(q):")
+                if choice == "1":
+                    self._log("establish TCP channel", msg_before='\n')
+                    ctl.send(Protocol.pack(cmd=RegisterCommand(ResponseType.TCP)))
+                    break
+                elif choice == "2":
+                    self._log("establish UDP channel", msg_before='\n')
+                    ctl.send(Protocol.pack(cmd=RegisterCommand(ResponseType.UDP)))
+                    break
+
+        elif response_type == ResponseType.REGISTER_COMPLETE:
+            cmd_instance = cast(RegisterCompleteCommand, cmd_instance)
+            public_port = cmd_instance.public_port
+            self._log(f"{public_port}")
+            channel_type = cmd_instance.channel_type
+            if channel_type == ResponseType.TCP:
+                server_data_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                server_data_sock.connect((self._config['server_ip'], self._config['tcp_endpoint']))
+                server_data_sock.send(Protocol.pack(cmd=ServiceBindCommand(public_port, channel_type)))
+                local_app_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                local_app_sock.connect((self._config["local_host"], self._config["local_port"]))
+                new_service = TCPServiceClient(
+                    ctl=ctl,
+                    channel_type=channel_type,
+                    public_port=public_port,
+                    local_sock=local_app_sock
+                )
+                self._services[public_port] = new_service
+
+                self._sel.register(server_data_sock, selectors.EVENT_READ, data=(Tag.TCP_RECV, local_app_sock))
+                self._sel.register(local_app_sock, selectors.EVENT_READ, data=(Tag.TCP_RECV, server_data_sock))
+
+            elif channel_type == ResponseType.UDP:
+                new_service = UDPServiceClient(
+                    ctl=ctl,
+                    public_port=public_port,
+                    channel_type=channel_type,
+                )
+                # self._sel.modify(self._udp_data_sock, selectors.EVENT_READ, data=(Tag.UDP_SERVER, public_port))
+                self._services[public_port] = new_service
+
+                ctl.send(Protocol.pack(cmd=ReadyHolePunchingCommand(public_port)))
+            else:
+                self._log(f"Unknown channel type {channel_type}")
+
+            self._log(f"{channel_type} channel established, using {self._config['server_ip']}:{public_port} to connect")
+        elif response_type == ResponseType.NEW_USER:
+            local_app_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            local_app_sock.connect((self._config["local_host"], self._config["local_port"]))
+            cmd_instance = cast(NewUserCommand, cmd_instance)
+            n_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            n_socket.connect((self._config['server_ip'], self._config['tcp_endpoint']))
+            n_socket.send(Protocol.pack(
+                cmd=ServiceBindCommand(public_port=cmd_instance.public_port, channel_type=ResponseType.TCP)))
+            self._sel.register(n_socket, selectors.EVENT_READ, data=(Tag.TCP_RECV, local_app_sock))
+            self._sel.register(local_app_sock, selectors.EVENT_READ, data=(Tag.TCP_RECV, n_socket))
+        elif response_type == ResponseType.HOLE_PUNCHING:
+            cmd_instance = cast(HolePunchingCommand, cmd_instance)
+            self._log(f"HOLE_PUNCHING{cmd_instance.public_port}")
+            # todo 加上超时重传，保证网络状态不好导致第一个打洞包没收到也能被处理
+            self._udp_data_sock.sendto(self.pack_udp(sid=0, public_port=cmd_instance.public_port, data=b''),
+                                       (self._config["server_ip"], self._config["udp_endpoint"]))
+        elif response_type == ResponseType.HOLE_PUNCHING_COMPLETE:
+            cmd_instance = cast(HolePunchingCompleteCommand, cmd_instance)
+            self._log(f"hole punch complete")
+            # todo 后续完成UDP的keepalive，且取消超时重传重传
+        else:
+            self._log("Client receive unknown response")
+
+    def _tcp_data_trans(self, sock_a: socket.socket, sock_b: socket.socket):
+        # TCP socket pair 可读
+        try:
+            recv_data = sock_a.recv(1024)
+            if not recv_data:
+                self._sel.unregister(sock_a)
+                self._sel.unregister(sock_b)
+                sock_a.close()
+                sock_b.close()
+            else:
+                sock_b.sendall(recv_data)
+        except (ConnectionResetError, OSError):
+            self._sel.unregister(sock_a)
+            self._sel.unregister(sock_b)
+            sock_a.close()
+            sock_b.close()
+
+    def _udp_data_s2l(self, udp_data_sock: socket.socket):
+        recv_data, addr = udp_data_sock.recvfrom(2048)
+        sid, public_port, data = self.unpack_udp(recv_data)
+        service = cast(UDPServiceClient, self._services[public_port])
+        fake_user_sock = None
+        if sid not in service.sid2sock:
+            service.session_counter += 1
+            # 新建一个本地的sock，假装是"局域网内的sock"
+            fake_user_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            fake_user_sock.bind(("0.0.0.0", 0))
+            service.sid2sock[sid] = fake_user_sock
+            service.sock2sid[fake_user_sock] = sid
+            self._sel.register(fake_user_sock, selectors.EVENT_READ, data=(Tag.UDP_LOCAL, sid, public_port))
+        else:
+            fake_user_sock = service.sid2sock[sid]
+
+        # 由假装的sock向本地应用发送数据
+        fake_user_sock.sendto(data, (self._config["local_host"], self._config["local_port"]))
+
+    def _udp_data_l2s(self, fake_user_sock: socket.socket, sid: int, port: int):
+        recv_data, addr = fake_user_sock.recvfrom(2048)
+        service = cast(UDPServiceClient, self._services[port])
+        packed_data = self.pack_udp(sid, port, recv_data)
+        self._udp_data_sock.sendto(packed_data, (self._config["server_ip"], self._config["udp_endpoint"]))
+
+    def _log(self, msg, msg_before=None):
+        if msg_before is not None:
+            print(msg_before)
         from datetime import datetime
         print(f"[{type(self).__name__}//{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] {msg}")
 
@@ -36,139 +189,36 @@ class Client:
             print('ezfrp_client.json not found, creating a new one using default configuration')
             config = {
                 "server_ip": "124.221.101.254",
-                "control_port": 7000,
+                "tcp_endpoint": 7000,
+                "udp_endpoint": 7001,
+
                 "local_host": "127.0.0.1",
-                "local_port": 25565,
-                "udp_data_port":7001
+                "local_port": 25565
             }
             with open('ezfrp_client.json', 'w') as f:
                 f.write(json.dumps(config))
         return config
 
     @staticmethod
-    def pack_udp(sid: int, data: bytes, method="!I") -> bytes:
-        return struct.pack(method, sid) + data
+    def pack_udp(sid: int, public_port: int, data: bytes, sid_fmt="!I", port_fmt="I") -> bytes:
+        return struct.pack(sid_fmt + port_fmt, sid, public_port) + data
 
     @staticmethod
-    def unpack_udp(data: bytes, method="!I") -> tuple[int, bytes]:
-        session_id = struct.unpack(method, data[:4])[0]
-        packet_data = data[4:]
-        return session_id, packet_data
+    def unpack_udp(data: bytes, sid_fmt="!I", port_fmt="I") -> tuple[int, int, bytes]:
+        header_size = struct.calcsize(sid_fmt + port_fmt)
+        session_id, public_port = struct.unpack(sid_fmt + port_fmt, data[:header_size])
+        packet_data = data[header_size:]
+        return session_id, public_port, packet_data
 
-    def handle_control(self):
-        self._log(f"Successfully connected to server {self._config['server_ip']}")
-        while True:
-            choice = input("Establishing TCP(1) or UDP(2) tunnel:")
-            if choice == '1':
-                self._ctl_listen.send(bytes('TCP', "utf-8"))
-                # daemon继承
-                # threading.Thread(target=self.handle_control_tcp).start()
-                self.handle_control_tcp()
-                break
-            elif choice == '2':
-                self._ctl_listen.send(bytes('UDP', "utf-8"))
-                client_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                client_sock.bind(("0.0.0.0", 0)) # 绑定一个随机端口作为和Server转发UDP data的出入口
-                
-                # threading.Thread(target=self.handle_control_udp, args=(client_sock,)).start()
-                self.handle_control_udp(client_sock)
-                break
-
-    def handle_control_udp(self, client_socket: socket.socket):
-        self._log(f"client socket bound to {client_socket.getsockname()}")
-        cmd = self._ctl_listen.recv(1024).decode("utf-8")
-        # 等待接收Server打洞的指令，然后Client就可以发送一个UDP包过去，让Server知道被NAT映射后的端口
-        self._log(f"client command received: {cmd}")
-        if cmd == "UDP_HOLE_PUNCHING":
-            data = Client.pack_udp(0,b'UDP_HOLE_PUNCHING')
-            client_socket.sendto(data, (self._config['server_ip'], self._config['udp_data_port'])) # NAT 打洞
-
-        def keepalive():
-            import time
-            while True:
-                time.sleep(10)
-                data = Client.pack_udp(0,b'UDP_KEEPALIVE')
-                client_socket.sendto(data, (self._config['server_ip'], self._config['udp_data_port']))
-
-        threading.Thread(target=keepalive, daemon=True).start()
-
-        self._udp_sel.register(client_socket, selectors.EVENT_READ, data=(TAG_UDP_TO_LOCAL, 0))
-        while True:
-            events = self._udp_sel.select()
-            for key, mask in events:
-                if mask & selectors.EVENT_READ:
-                    origin_sock = cast(socket.socket, key.fileobj)
-                    packet_type = key.data[0]
-                    if packet_type == TAG_UDP_TO_LOCAL:
-                        packet_with_sid, _ = origin_sock.recvfrom(4096)
-                        sid, packet_data = Client.unpack_udp(packet_with_sid)
-                        if sid not in self._sid2sock:
-                            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                            sock.bind((self._config['local_host'], 0))
-                            self._sid2sock[sid] = sock
-                            self._sock2sid[sock] = sid
-                            self._udp_sel.register(sock, selectors.EVENT_READ, data=(TAG_UDP_TO_SERVER, sid))
-
-                        sock = self._sid2sock[sid]
-                        sock.sendto(packet_data, (self._config['local_host'], self._config['local_port']))
-                    elif packet_type == TAG_UDP_TO_SERVER:
-                        packet_data, _ = origin_sock.recvfrom(4096)
-                        sid = key.data[1]
-                        packet_with_sid = Client.pack_udp(sid, packet_data)
-                        client_socket.sendto(packet_with_sid, (self._config['server_ip'], self._config['udp_data_port']))
-
-
-    def handle_control_tcp(self):
-        self._tcp_sel.register(self._ctl_listen, selectors.EVENT_READ, data=TAG_TCP_ACCEPT)
-        while True:
-            events = self._tcp_sel.select()
-            for key, mask in events:
-                data = key.data
-                if data == TAG_TCP_ACCEPT:
-                    sock = cast(socket.socket, key.fileobj)
-                    cmd = sock.recv(1024).decode('utf-8')
-                    if cmd == 'new':
-                        self._log(f"new command {cmd}")
-                        server_data = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        server_data.connect((self._config['server_ip'], self._config['control_port']))
-                        self._sockets.append(server_data)
-                        local_data = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        local_data.connect((self._config['local_host'], self._config['local_port']))
-                        self._sockets.append(local_data)
-                        self._tcp_sel.register(server_data, selectors.EVENT_READ, data=local_data)
-                        self._tcp_sel.register(local_data, selectors.EVENT_READ, data=server_data)
-                elif isinstance(data, socket.socket):
-                    sock_a = cast(socket.socket, key.fileobj)
-                    sock_b = key.data
-                    try:
-                        recv_data = sock_a.recv(1024)
-                        if not recv_data:
-                            self._tcp_sel.unregister(sock_a)
-                            self._tcp_sel.unregister(sock_b)
-                            sock_a.close()
-                            sock_b.close()
-                        else:
-                            sock_b.send(recv_data)
-                    except (ConnectionResetError, OSError):
-                        self._tcp_sel.unregister(sock_a)
-                        self._tcp_sel.unregister(sock_b)
-                        sock_a.close()
-                        sock_b.close()
-
-    def send_cmd(self, param):
-        pass
 
     def quit(self):
-        for s in self._sockets:
-            s.close()
-        for s in self._sock2sid:
-            s.close()
+        pass
+
 
 if __name__ == '__main__':
     client = Client()
-    client.control_thread.join()
+    # client.control_thread.join()
     while True:
         cli_cmd = input("q to quit:")
         if cli_cmd == 'q':
             break
-

@@ -23,3 +23,16 @@ class UDPService(BaseService):
     addr2sid: dict = field(default_factory=dict)   # (user_ip, user_port) -> session_id
     sid2addr: dict = field(default_factory=dict)   # session_id -> (user_ip, user_port)
     sid2usock: dict = field(default_factory=dict) # session_id -> user sock
+
+#####################CLIENT SERVICE########################
+
+@dataclass
+class TCPServiceClient(BaseService):
+    local_sock: socket.socket = None # 似乎没有用 TCPServiceClient 不需要额外记录
+
+@dataclass
+class UDPServiceClient(BaseService):
+    local_sock: socket.socket = None
+    session_counter: int = 0
+    sock2sid: dict = field(default_factory=dict)   # (user_ip, user_port) -> session_id
+    sid2sock: dict = field(default_factory=dict)   # session_id -> (user_ip, user_port)

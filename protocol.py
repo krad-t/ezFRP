@@ -11,11 +11,11 @@ class ResponseType(StrEnum):
     UDP = "UDP"
     CLIENT_LOGIN = "CLIENT_LOGIN"
     CLIENT_LOGIN_COMPLETE = "CLIENT_LOGIN_COMPLETE"
-
     SERVICE_BIND = "SERVICE_BIND"
     REGISTER = "REGISTER"
     REGISTER_COMPLETE = "REGISTER_COMPLETE"
     NEW_USER = "NEW_USER"
+    READY_HOLE_PUNCHING = "READY_HOLE_PUNCHING"
     HOLE_PUNCHING = "HOLE_PUNCHING"
     HOLE_PUNCHING_COMPLETE = "HOLE_PUNCHING_COMPLETE"
 
@@ -23,20 +23,24 @@ class ResponseType(StrEnum):
 # 全局命令注册表
 COMMAND_REGISTRY: dict[ResponseType, Type] = {}
 
+
 @dataclass
 class BaseCommand(ABC):
     """所有命令的基类"""
+
     @classmethod
     @abstractmethod
     def get_cmd_type(cls) -> ResponseType:
         """子类必须实现：返回对应的 ResponseType"""
         pass
 
+
 def register_cmd(cls: Type[BaseCommand]) -> Type[BaseCommand]:
     """装饰器：自动将命令类注册到全局表"""
     cmd_type = cls.get_cmd_type()
     COMMAND_REGISTRY[cmd_type] = cls
     return cls
+
 
 # 具体命令类
 @register_cmd
@@ -59,14 +63,17 @@ class RegisterCommand(BaseCommand):
     def get_cmd_type(cls) -> ResponseType:
         return ResponseType.REGISTER
 
+
 @register_cmd
 @dataclass
 class RegisterCompleteCommand(BaseCommand):
-    public_port:int
-    
+    public_port: int
+    channel_type: ResponseType
+
     @classmethod
     def get_cmd_type(cls) -> ResponseType:
         return ResponseType.REGISTER_COMPLETE
+
 
 @register_cmd
 @dataclass
@@ -77,6 +84,15 @@ class ServiceBindCommand(BaseCommand):
     @classmethod
     def get_cmd_type(cls) -> ResponseType:
         return ResponseType.SERVICE_BIND
+
+@register_cmd
+@dataclass
+class ReadyHolePunchingCommand(BaseCommand):
+    public_port: int
+
+    @classmethod
+    def get_cmd_type(cls) -> ResponseType:
+        return ResponseType.READY_HOLE_PUNCHING
 
 @register_cmd
 @dataclass
@@ -97,6 +113,7 @@ class LoginCompleteCommand(BaseCommand):
     def get_cmd_type(cls) -> ResponseType:
         return ResponseType.CLIENT_LOGIN_COMPLETE
 
+
 @register_cmd
 @dataclass
 class ClientLoginCommand(BaseCommand):
@@ -104,9 +121,12 @@ class ClientLoginCommand(BaseCommand):
     def get_cmd_type(cls) -> ResponseType:
         return ResponseType.CLIENT_LOGIN
 
+
 @register_cmd
 @dataclass()
 class HolePunchingCompleteCommand(BaseCommand):
+    public_port: int
+
     @classmethod
     def get_cmd_type(cls) -> ResponseType:
         return ResponseType.HOLE_PUNCHING_COMPLETE
@@ -120,7 +140,7 @@ class Protocol:
             "data": asdict(cmd)
         }
         return json.dumps(payload).encode()
-    
+
     @staticmethod
     def unpack(raw: bytes) -> tuple[ResponseType, BaseCommand]:
         raw_data = json.loads(raw.decode())

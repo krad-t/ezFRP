@@ -10,7 +10,8 @@ except FileNotFoundError:
 
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 SERVER_IP = config['server_ip']
-s.connect((SERVER_IP,9999))
+port = int(input("port:"))
+s.connect((SERVER_IP,port))
 while True:
     data = input(f"input anything(q to quit){s.getsockname()}:")
     if data == 'q':

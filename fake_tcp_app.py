@@ -1,23 +1,26 @@
 import socket
-import threading
+import selectors
+from typing import cast
 
-def handle_client(conn, addr):
-    print(f"connected from {addr}")
-    while True:
-        data = conn.recv(1024)
-        if not data:
-            break
-        print(f"received: {conn}-{data}")
-        conn.sendall(b"response from fake app: " + data)
-    conn.close()
-    print(f"disconnected: {addr}")
 
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.bind(("127.0.0.1", 25565))
+s.bind(("127.0.0.1", 0))
 s.listen(5)
-print("====fake local app listening on 25565===")
+sel = selectors.DefaultSelector()
+sel.register(s, selectors.EVENT_READ,data=1)
+print(f"====fake local app listening on {s.getsockname()[1]}===")
 print("====             TCP                 ===")
 
 while True:
-    conn, addr = s.accept()
-    threading.Thread(target=handle_client, args=(conn, addr)).start()
+    events = sel.select()
+    for key, mask in events:
+        if mask & selectors.EVENT_READ:
+            sock = cast(socket.socket, key.fileobj)
+            data = int(key.data)
+            if data == 1:
+                tcp, _ = sock.accept()
+                sel.register(tcp, selectors.EVENT_READ, data=2)
+            elif data == 2:
+                recv_data = sock.recv(1024)
+                print(f"received: {sock.getpeername()}-{recv_data}")
+                sock.send(recv_data)
