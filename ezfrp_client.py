@@ -1,6 +1,7 @@
 import struct
 import selectors
 from enum import IntEnum
+from shutil import chown
 from typing import cast
 
 from ezfrp_service import *
@@ -13,29 +14,33 @@ class Tag(IntEnum):
     TCP_RECV = 3  # TCP pair 可读
     UDP_SERVER = 4
     UDP_LOCAL = 5
+    QUIT = 6
 
 
 class Client:
     def __init__(self):
         self._config = self.configure()
-        self._sockets = []
         self._sel = selectors.DefaultSelector()
+        self._sockets = []
         self._ctl = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._udp_data_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._udp_data_sock.bind(("0.0.0.0", 0))
 
+        self._sig_r, self._sig_w = socket.socketpair()
+        self._running = True
+
         self._services: dict[int, BaseService] = dict()
-        self.run()
 
     def run(self):
+        self._sel.register(self._sig_r, selectors.EVENT_READ, data=(Tag.QUIT,))
         self._sel.register(self._ctl, selectors.EVENT_READ, data=(Tag.CTL_RECV,))
         self._sel.register(self._udp_data_sock, selectors.EVENT_READ, data=(Tag.UDP_SERVER,))
         self._ctl.connect((self._config['server_ip'], self._config['tcp_endpoint']))
         self._log(f"Client connected to Server(1/2)")
         self._ctl.send(Protocol.pack(cmd=ClientLoginCommand()))
 
-        while True:
-            events = self._sel.select()
+        while self._running:
+            events = self._sel.select(timeout=15)
             for key, mask in events:
                 if mask & selectors.EVENT_READ:
                     sock = cast(socket.socket, key.fileobj)
@@ -49,12 +54,28 @@ class Client:
                         self._udp_data_s2l(sock)
                     elif tag == Tag.UDP_LOCAL:
                         self._udp_data_l2s(sock, *args)
+                    elif tag == Tag.QUIT:
+                        self._log("Shutting down...")
+                        self._ctl.close()
+                        self._running = False
+                        break
+            for s in self._services.values():
+                if s.channel_type == ResponseType.UDP:
+                    self._hole_punching(s.public_port)
+
+    def signal_quit(self):
+        self._sig_w.send(b"\x00")
+
+    def _hole_punching(self,public_port:int):
+        self._udp_data_sock.sendto(self.pack_udp(sid=0, public_port=public_port, data=b''),
+                                   (self._config["server_ip"], self._config["udp_endpoint"]))
 
     def _handle_ctl(self, ctl):
         raw_data = ctl.recv(1024)
         if not raw_data:
-            self._log("Client receive empty data when login, unknown error(2/2)")
+            self._log("Server closed")
             self._sel.unregister(self._ctl)
+            self._ctl.close()
             return
         response_type, cmd_instance = Protocol.unpack(raw_data)
         if response_type == ResponseType.CLIENT_LOGIN_COMPLETE:
@@ -65,12 +86,24 @@ class Client:
                 choice = input("input to choose channel,TCP(1),UDP(2) or quit(q):")
                 if choice == "1":
                     self._log("establish TCP channel", msg_before='\n')
+                    try:
+                        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        probe.settimeout(3)
+                        probe.connect((self._config["local_host"], self._config["local_port"]))
+                        probe.close()
+                    except (ConnectionRefusedError, OSError):
+                        self._log(f"Waiting Local APP at port {self._config['local_port']} start")
+                        continue
                     ctl.send(Protocol.pack(cmd=RegisterCommand(ResponseType.TCP)))
                     break
                 elif choice == "2":
                     self._log("establish UDP channel", msg_before='\n')
                     ctl.send(Protocol.pack(cmd=RegisterCommand(ResponseType.UDP)))
                     break
+                # elif choice == "q":
+                #     self.quit()
+                #     break
+
 
         elif response_type == ResponseType.REGISTER_COMPLETE:
             cmd_instance = cast(RegisterCompleteCommand, cmd_instance)
@@ -78,11 +111,16 @@ class Client:
             self._log(f"{public_port}")
             channel_type = cmd_instance.channel_type
             if channel_type == ResponseType.TCP:
+                local_app_sock = None
+                try:
+                    local_app_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    local_app_sock.connect((self._config["local_host"], self._config["local_port"]))
+                except (ConnectionRefusedError, OSError):
+                    self._log("Local APP disconnect unexpectedly")
+                    return
                 server_data_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 server_data_sock.connect((self._config['server_ip'], self._config['tcp_endpoint']))
                 server_data_sock.send(Protocol.pack(cmd=ServiceBindCommand(public_port, channel_type)))
-                local_app_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                local_app_sock.connect((self._config["local_host"], self._config["local_port"]))
                 new_service = TCPServiceClient(
                     ctl=ctl,
                     channel_type=channel_type,
@@ -100,9 +138,7 @@ class Client:
                     public_port=public_port,
                     channel_type=channel_type,
                 )
-                # self._sel.modify(self._udp_data_sock, selectors.EVENT_READ, data=(Tag.UDP_SERVER, public_port))
                 self._services[public_port] = new_service
-
                 ctl.send(Protocol.pack(cmd=ReadyHolePunchingCommand(public_port)))
             else:
                 self._log(f"Unknown channel type {channel_type}")
@@ -121,20 +157,17 @@ class Client:
         elif response_type == ResponseType.HOLE_PUNCHING:
             cmd_instance = cast(HolePunchingCommand, cmd_instance)
             self._log(f"HOLE_PUNCHING{cmd_instance.public_port}")
-            # todo 加上超时重传，保证网络状态不好导致第一个打洞包没收到也能被处理
-            self._udp_data_sock.sendto(self.pack_udp(sid=0, public_port=cmd_instance.public_port, data=b''),
-                                       (self._config["server_ip"], self._config["udp_endpoint"]))
+            self._hole_punching(public_port=cmd_instance.public_port)
         elif response_type == ResponseType.HOLE_PUNCHING_COMPLETE:
             cmd_instance = cast(HolePunchingCompleteCommand, cmd_instance)
             self._log(f"hole punch complete")
-            # todo 后续完成UDP的keepalive，且取消超时重传重传
         else:
             self._log("Client receive unknown response")
 
     def _tcp_data_trans(self, sock_a: socket.socket, sock_b: socket.socket):
         # TCP socket pair 可读
         try:
-            recv_data = sock_a.recv(1024)
+            recv_data = sock_a.recv(65536)
             if not recv_data:
                 self._sel.unregister(sock_a)
                 self._sel.unregister(sock_b)
@@ -212,13 +245,20 @@ class Client:
 
 
     def quit(self):
-        pass
-
+        self._ctl.close()
+        import sys
+        sys.exit(0)
 
 if __name__ == '__main__':
+    import threading
+
     client = Client()
-    # client.control_thread.join()
+    t = threading.Thread(target=client.run)
+    t.start()
+
     while True:
-        cli_cmd = input("q to quit:")
-        if cli_cmd == 'q':
+        if input() == 'q':
+            client.signal_quit()
             break
+    t.join()
+

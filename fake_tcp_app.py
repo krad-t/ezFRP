@@ -22,5 +22,6 @@ while True:
                 sel.register(tcp, selectors.EVENT_READ, data=2)
             elif data == 2:
                 recv_data = sock.recv(1024)
-                print(f"received: {sock.getpeername()}-{recv_data}")
-                sock.send(recv_data)
+                if recv_data:
+                    print(f"received: {sock.getpeername()}-{recv_data}")
+                    sock.send(recv_data)

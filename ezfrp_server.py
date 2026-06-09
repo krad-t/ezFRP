@@ -2,7 +2,7 @@ import struct
 import selectors
 import heapq
 from typing import cast
-from enum import IntEnum
+from enum import IntEnum, nonmember
 
 from protocol import *
 from ezfrp_service import *
@@ -44,21 +44,17 @@ class Server:
 
     def __init__(self):
         self.config = Server.configure()
-        self._sockets = []
         self._dispatch_listen_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._dispatch_listen_tcp.bind(("0.0.0.0", self.config['tcp_endpoint']))
         self._dispatch_listen_tcp.listen(1)
-        self._sockets.append(self._dispatch_listen_tcp)
 
         self._client_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._client_udp.bind(("0.0.0.0", self.config['udp_endpoint']))
-        self._sockets.append(self._client_udp)
         self._sel = selectors.DefaultSelector()
 
         # 记录不同的服务组，"1个Client-n个User的1种协议通道" 定义为一组"服务"，服务和对外暴露的端口一一映射
         self._services: dict[int, BaseService] = dict()
         self._log("Server initialized")
-        self.run()
 
     def run(self):
         self._sel.register(self._dispatch_listen_tcp, selectors.EVENT_READ, data=(Tag.DSP_ACCEPT,))
@@ -108,9 +104,6 @@ class Server:
 
         return public_port
 
-    def quit(self):
-        for s in self._sockets:
-            s.close()
 
     def _log(self, msg):
         from datetime import datetime
@@ -124,7 +117,6 @@ class Server:
                 config = json.load(f)
         except FileNotFoundError:
             print('ezfrp_server.json not found, creating a new one using default configuration')
-            # todo修改默认的填充格式
             config = {
                 "tcp_endpoint": 7000,
                 "udp_endpoint": 7001,
@@ -158,6 +150,7 @@ class Server:
         if not raw_data:
             self._log(f"Client disconnected: {unknown_channel.getpeername()}")
             self._sel.unregister(unknown_channel)
+            unknown_channel.close()
             return
         # 解析data的指令
         response_type, cmd_instance = Protocol.unpack(raw_data)
@@ -185,6 +178,33 @@ class Server:
         if not raw_data:
             self._log(f"Client disconnected: {ctl_channel.getpeername()}")
             self._sel.unregister(ctl_channel)
+            for s in list(self._services.values()):
+                public_port = s.public_port
+                if ctl_channel == s.ctl:
+                    if s.channel_type == ResponseType.TCP:
+                        s = cast(TCPService, s)
+                        self._portAllocator.free_a_port(public_port)
+                        self._sel.unregister(s.public_listen_sock)
+                        s.public_listen_sock.close()
+                        for conn_d in s.free_data_conns:
+                            try:
+                                self._sel.unregister(conn_d)
+                            except (KeyError, ValueError):
+                                pass
+                            conn_d.close()
+                        for conn_u in s.pending_users:
+                            try:
+                                self._sel.unregister(conn_u)
+                            except (KeyError, ValueError):
+                                pass
+                            conn_u.close()
+                        del self._services[public_port]
+                    elif s.channel_type == ResponseType.UDP:
+                        s = cast(UDPService, s)
+                        # 似乎没有要关闭的？UDP是无连接的？
+                        # 只需要清空服务即可
+                        del self._services[public_port]
+            ctl_channel.close()
             return
         response_type, cmd_instance = Protocol.unpack(raw_data)
         if response_type == ResponseType.REGISTER:
@@ -219,7 +239,6 @@ class Server:
             # Client 发来准备打洞命令，Server应该开启监听
             cmd_instance = cast(ReadyHolePunchingCommand, cmd_instance)
             service = self._services[cmd_instance.public_port]
-            self._log(f"READY_HOLE_PUNCHING{cmd_instance.public_port}")
             public_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             public_port = cmd_instance.public_port
             public_sock.bind(("0.0.0.0", public_port))
@@ -246,7 +265,7 @@ class Server:
     def _tcp_data_trans(self, sock_a: socket.socket, sock_b: socket.socket):
         # TCP socket pair 可读
         try:
-            recv_data = sock_a.recv(1024)
+            recv_data = sock_a.recv(65536)
             if not recv_data:
                 self._sel.unregister(sock_a)
                 self._sel.unregister(sock_b)
@@ -297,9 +316,11 @@ class Server:
 
 
 if __name__ == '__main__':
-    server = Server()
+    import threading
+    s = Server()
+    threading.Thread(target=s.run, daemon=True).start()
     while True:
-        cli_cmd = input("q to quit:\n")
-        if cli_cmd == 'q':
-            server.quit()
+        cli = input()
+        if cli == 'q':
+            print("quit")
             break
