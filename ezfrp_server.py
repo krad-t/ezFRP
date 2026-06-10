@@ -46,7 +46,7 @@ class Server:
         self.config = Server.configure()
         self._dispatch_listen_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._dispatch_listen_tcp.bind(("0.0.0.0", self.config['tcp_endpoint']))
-        self._dispatch_listen_tcp.listen(1)
+        self._dispatch_listen_tcp.listen(10)
 
         self._client_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._client_udp.bind(("0.0.0.0", self.config['udp_endpoint']))
@@ -152,8 +152,17 @@ class Server:
             self._sel.unregister(unknown_channel)
             unknown_channel.close()
             return
+
+
         # 解析data的指令
-        response_type, cmd_instance = Protocol.unpack(raw_data)
+        try:
+            response_type, cmd_instance = Protocol.unpack(raw_data)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._log(f"Bad protocol data from {unknown_channel.getpeername()}, dropping")
+            self._log(f"{raw_data}")
+            self._sel.unregister(unknown_channel)
+            unknown_channel.close()
+            return
         # 如果是CLIENT_LOGIN，这表示Client第一次连接Server
         if response_type == ResponseType.CLIENT_LOGIN:
             # 说明这是一个控制通道，注册为CTL_RECV
