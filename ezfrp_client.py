@@ -111,26 +111,12 @@ class Client:
             self._log(f"{public_port}")
             channel_type = cmd_instance.channel_type
             if channel_type == ResponseType.TCP:
-                local_app_sock = None
-                try:
-                    local_app_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    local_app_sock.connect((self._config["local_host"], self._config["local_port"]))
-                except (ConnectionRefusedError, OSError):
-                    self._log("Local APP disconnect unexpectedly")
-                    return
-                server_data_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                server_data_sock.connect((self._config['server_ip'], self._config['tcp_endpoint']))
-                server_data_sock.send(Protocol.pack(cmd=ServiceBindCommand(public_port, channel_type)))
                 new_service = TCPServiceClient(
                     ctl=ctl,
                     channel_type=channel_type,
-                    public_port=public_port,
-                    local_sock=local_app_sock
+                    public_port=public_port
                 )
                 self._services[public_port] = new_service
-
-                self._sel.register(server_data_sock, selectors.EVENT_READ, data=(Tag.TCP_RECV, local_app_sock))
-                self._sel.register(local_app_sock, selectors.EVENT_READ, data=(Tag.TCP_RECV, server_data_sock))
 
             elif channel_type == ResponseType.UDP:
                 new_service = UDPServiceClient(
