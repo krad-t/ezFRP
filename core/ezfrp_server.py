@@ -20,10 +20,11 @@ class Tag(IntEnum):
 
 class Server:
     class PortAllocator:
-        _data = []
-        _used = {}
+        """公网端口分配器：负责 min_port-max_port 段的预留与释放"""
 
         def __init__(self, min_port, max_port):
+            self._data = []
+            self._used = {}
             for port in range(min_port, max_port + 1):
                 heapq.heappush(self._data, port)
 
@@ -32,18 +33,25 @@ class Server:
             self._used[port] = True
             return port
 
+        def reserve(self, port: int) -> bool:
+            """尝试预留指定端口；成功返回 True，端口被占用或不在池内返回 False"""
+            if self.is_used(port) or port not in self._data:
+                return False
+            self._data.remove(port)
+            heapq.heapify(self._data)
+            self._used[port] = True
+            return True
+
         def free_a_port(self, port: int):
             heapq.heappush(self._data, port)
             self._used.pop(port, None)
 
         def is_used(self, port: int) -> bool:
-            # todo 暂时未使用到此函数
             return port in self._used
-
-    _portAllocator = None
 
     def __init__(self):
         self.config = Server.configure()
+        self._portAllocator = None
         self._dispatch_listen_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._dispatch_listen_tcp.bind(("0.0.0.0", self.config['tcp_endpoint']))
         self._dispatch_listen_tcp.listen(10)
@@ -52,7 +60,7 @@ class Server:
         self._client_udp.bind(("0.0.0.0", self.config['udp_endpoint']))
         self._sel = selectors.DefaultSelector()
 
-        # 记录不同的服务组，"1个Client-n个User的1种协议通道" 定义为一组"服务"，服务和对外暴露的端口一一映射
+        # 记录不同的服务组，"连接1个Client和n个User的1种协议通道,也即特定的一种协议通道" 定义为一组"服务"，服务和对外暴露的端口一一映射
         self._services: dict[int, BaseService] = dict()
         self._log("Server initialized")
 
@@ -69,9 +77,9 @@ class Server:
                     if tag == Tag.DSP_ACCEPT:
                         self._client_dispatch_acc(sock)
                     elif tag == Tag.UNK_RECV:
-                        self._client_handle_unk(sock)
+                        self._client_handle_unk(sock, *args)
                     elif tag == Tag.CTL_RECV:
-                        self._handle_ctl_cmd(sock)
+                        self._handle_ctl_cmd(sock, *args)
                     elif tag == Tag.TCP_ACCEPT:
                         self._tcp_accept_user(sock, *args)
                     elif tag == Tag.TCP_DATA:
@@ -83,19 +91,31 @@ class Server:
                     else:
                         self._log(f"Unknown tag: {tag}")
 
-    def _assign_service_ports(self, service: BaseService) -> int:
+    def _assign_service_ports(self, service: BaseService, requested_port: int = 0) -> int:
         if self._portAllocator is None:
             self._portAllocator = Server.PortAllocator(min_port=self.config["min_port"],
                                                        max_port=self.config["max_port"])
 
-        public_port = self._portAllocator.get_a_free_port()
+        if requested_port and self._portAllocator.reserve(requested_port):
+            public_port = requested_port
+            self._log(f"Granted requested public port {public_port} for {service.channel_type} service")
+        else:
+            if requested_port:
+                self._log(f"Requested port {requested_port} unavailable, auto-assigning")
+            public_port = self._portAllocator.get_a_free_port()
 
         if service.channel_type == ResponseType.UDP:
             service.public_port = public_port
         elif service.channel_type == ResponseType.TCP:
             service = cast(TCPService, service)
             public_listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            public_listen_sock.bind(("0.0.0.0", public_port))
+            try:
+                public_listen_sock.bind(("0.0.0.0", public_port))
+            except OSError as e:
+                self._log(f"Bind public port {public_port} failed: {e}, releasing port")
+                self._portAllocator.free_a_port(public_port)
+                public_listen_sock.close()
+                raise
             public_listen_sock.listen(1)
             service.public_listen_sock = public_listen_sock
             service.public_port = public_port
@@ -113,7 +133,7 @@ class Server:
     def configure():
         import json
         try:
-            with open('ezfrp_server.json', 'r') as f:
+            with open('../config/ezfrp_server.json', 'r') as f:
                 config = json.load(f)
         except FileNotFoundError:
             print('ezfrp_server.json not found, creating a new one using default configuration')
@@ -124,7 +144,7 @@ class Server:
                 "min_port": 9900
             }
 
-            with open('ezfrp_server.json', 'w') as f:
+            with open('../config/ezfrp_server.json', 'w') as f:
                 f.write(json.dumps(config))
         return config
 
@@ -142,10 +162,10 @@ class Server:
     def _client_dispatch_acc(self, dispatch_listen: socket.socket):
         # _dispatch_listen 有新 Client 此时sock == _dispatch_listen
         unknown_channel, _ = dispatch_listen.accept()
-        self._sel.register(unknown_channel, selectors.EVENT_READ, data=(Tag.UNK_RECV,))
+        self._sel.register(unknown_channel, selectors.EVENT_READ, data=(Tag.UNK_RECV, FrameBuffer()))
         self._log(f"Connected to client: {unknown_channel.getpeername()}")
 
-    def _client_handle_unk(self, unknown_channel: socket.socket):
+    def _client_handle_unk(self, unknown_channel: socket.socket, frame_buf: FrameBuffer):
         raw_data = unknown_channel.recv(1024)
         if not raw_data:
             self._log(f"Client disconnected: {unknown_channel.getpeername()}")
@@ -153,108 +173,145 @@ class Server:
             unknown_channel.close()
             return
 
-
-        # 解析data的指令
+        # 解析data的指令（一次 recv 可能包含多条帧）
         try:
-            response_type, cmd_instance = Protocol.unpack(raw_data)
-        except (json.JSONDecodeError, UnicodeDecodeError):
+            frames = frame_buf.feed(raw_data)
+        except ValueError:
             self._log(f"Bad protocol data from {unknown_channel.getpeername()}, dropping")
             self._log(f"{raw_data}")
             self._sel.unregister(unknown_channel)
             unknown_channel.close()
             return
-        # 如果是CLIENT_LOGIN，这表示Client第一次连接Server
-        if response_type == ResponseType.CLIENT_LOGIN:
-            # 说明这是一个控制通道，注册为CTL_RECV
-            unknown_channel.send(Protocol.pack(cmd=LoginCompleteCommand()))
-            self._sel.modify(unknown_channel, selectors.EVENT_READ, data=(Tag.CTL_RECV,))
-        elif response_type == ResponseType.SERVICE_BIND:
-            # 说明这是一个绑定服务的请求, 只有TCP会从此绑定
-            cmd_instance = cast(ServiceBindCommand, cmd_instance)
-            public_port = cmd_instance.public_port
-            service = cast(TCPService, self._services[public_port])
-            if service.pending_users:
-                conn_user = service.pending_users.pop(0)
-                self._sel.register(conn_user, selectors.EVENT_READ, data=(Tag.TCP_DATA, unknown_channel))
-                self._sel.modify(unknown_channel, selectors.EVENT_READ, data=(Tag.TCP_DATA, conn_user))
+        for response_type, cmd_instance in frames:
+            # 如果是CLIENT_LOGIN，这表示Client第一次连接Server
+            if response_type == ResponseType.CLIENT_LOGIN:
+                # 说明这是一个控制通道，注册为CTL_RECV
+                unknown_channel.send(Protocol.pack(cmd=LoginCompleteCommand()))
+                self._sel.modify(unknown_channel, selectors.EVENT_READ, data=(Tag.CTL_RECV, frame_buf))
+            elif response_type == ResponseType.SERVICE_BIND:
+                # 说明这是一个绑定服务的请求, 只有TCP会从此绑定
+                cmd_instance = cast(ServiceBindCommand, cmd_instance)
+                public_port = cmd_instance.public_port
+                service = cast(TCPService, self._services[public_port])
+                if service.pending_users:
+                    conn_user = service.pending_users.pop(0)
+                    self._sel.register(conn_user, selectors.EVENT_READ, data=(Tag.TCP_DATA, unknown_channel))
+                    self._sel.modify(unknown_channel, selectors.EVENT_READ, data=(Tag.TCP_DATA, conn_user))
+                else:
+                    self._sel.unregister(unknown_channel)
+                    service.free_data_conns.append(unknown_channel)
             else:
-                self._sel.unregister(unknown_channel)
-                service.free_data_conns.append(unknown_channel)
+                self._log(f"Unexpected command on unknown channel: {response_type}")
 
-    def _handle_ctl_cmd(self, ctl_channel: socket.socket):
+    def _handle_ctl_cmd(self, ctl_channel: socket.socket, frame_buf: FrameBuffer):
         # 已有 Client 的控制通道可读
         raw_data = ctl_channel.recv(1024)
         if not raw_data:
-            self._log(f"Client disconnected: {ctl_channel.getpeername()}")
-            self._sel.unregister(ctl_channel)
-            for s in list(self._services.values()):
-                public_port = s.public_port
-                if ctl_channel == s.ctl:
-                    if s.channel_type == ResponseType.TCP:
-                        s = cast(TCPService, s)
-                        self._portAllocator.free_a_port(public_port)
-                        self._sel.unregister(s.public_listen_sock)
-                        s.public_listen_sock.close()
-                        for conn_d in s.free_data_conns:
-                            try:
-                                self._sel.unregister(conn_d)
-                            except (KeyError, ValueError):
-                                pass
-                            conn_d.close()
-                        for conn_u in s.pending_users:
-                            try:
-                                self._sel.unregister(conn_u)
-                            except (KeyError, ValueError):
-                                pass
-                            conn_u.close()
-                        del self._services[public_port]
-                    elif s.channel_type == ResponseType.UDP:
-                        s = cast(UDPService, s)
-                        # 似乎没有要关闭的？UDP是无连接的？
-                        # 只需要清空服务即可
-                        del self._services[public_port]
-            ctl_channel.close()
+            self._cleanup_client(ctl_channel)
             return
-        response_type, cmd_instance = Protocol.unpack(raw_data)
-        if response_type == ResponseType.REGISTER:
-            # Client 发来注册数据通道的请求
-            cmd_instance = cast(RegisterCommand, cmd_instance)
+        try:
+            frames = frame_buf.feed(raw_data)
+        except ValueError:
+            self._log(f"Bad protocol data on ctl from {ctl_channel.getpeername()}, dropping connection")
+            self._cleanup_client(ctl_channel)
+            return
+        for response_type, cmd_instance in frames:
+            if response_type == ResponseType.REGISTER:
+                # Client 发来注册数据通道的请求
+                cmd_instance = cast(RegisterCommand, cmd_instance)
+                try:
+                    if cmd_instance.channel_type == ResponseType.UDP:
+                        new_service = UDPService(
+                            ctl=ctl_channel,
+                            channel_type=ResponseType.UDP,
+                        )
+                        public_port = self._assign_service_ports(new_service, requested_port=cmd_instance.public_port)
 
-            if cmd_instance.channel_type == ResponseType.UDP:
-                new_service = UDPService(
-                    ctl=ctl_channel,
-                    channel_type=ResponseType.UDP,
-                )
-                public_port = self._assign_service_ports(new_service)
+                        self._services[public_port] = new_service
+                        new_service.ctl.send(Protocol.pack(
+                            cmd=RegisterCompleteCommand(public_port=public_port,
+                                                        channel_type=new_service.channel_type,
+                                                        service_id=cmd_instance.service_id)))
+                    elif cmd_instance.channel_type == ResponseType.TCP:
+                        new_service = TCPService(
+                            ctl=ctl_channel,
+                            channel_type=ResponseType.TCP
+                        )
+                        public_port = self._assign_service_ports(new_service, requested_port=cmd_instance.public_port)
+                        self._services[public_port] = new_service
 
-                self._services[public_port] = new_service
-                new_service.ctl.send(Protocol.pack(
-                    cmd=RegisterCompleteCommand(public_port=public_port, channel_type=new_service.channel_type)))
-            elif cmd_instance.channel_type == ResponseType.TCP:
-                new_service = TCPService(
-                    ctl=ctl_channel,
-                    channel_type=ResponseType.TCP
-                )
-                public_port = self._assign_service_ports(new_service)
-                self._services[public_port] = new_service
-
-                self._sel.register(new_service.public_listen_sock, selectors.EVENT_READ,
-                                   data=(Tag.TCP_ACCEPT, new_service))
-                new_service.ctl.send(Protocol.pack(
-                    cmd=RegisterCompleteCommand(public_port=public_port, channel_type=new_service.channel_type)))
+                        self._sel.register(new_service.public_listen_sock, selectors.EVENT_READ,
+                                           data=(Tag.TCP_ACCEPT, new_service))
+                        new_service.ctl.send(Protocol.pack(
+                            cmd=RegisterCompleteCommand(public_port=public_port,
+                                                        channel_type=new_service.channel_type,
+                                                        service_id=cmd_instance.service_id)))
+                    else:
+                        self._log(f"Unsupported channel type in REGISTER cmd: {cmd_instance.channel_type}")
+                except OSError:
+                    self._log(f"Failed to assign port for REGISTER from {ctl_channel.getpeername()}, skipped")
+            elif response_type == ResponseType.READY_HOLE_PUNCHING:
+                # Client 发来准备打洞命令，Server应该开启监听
+                cmd_instance = cast(ReadyHolePunchingCommand, cmd_instance)
+                service = cast(UDPService, self._services[cmd_instance.public_port])
+                public_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                public_port = cmd_instance.public_port
+                try:
+                    public_sock.bind(("0.0.0.0", public_port))
+                except OSError as e:
+                    self._log(f"Bind public UDP port {public_port} failed: {e}, dropping service")
+                    self._portAllocator.free_a_port(public_port)
+                    del self._services[public_port]
+                    public_sock.close()
+                    continue
+                service.public_sock = public_sock
+                ctl_channel.send(Protocol.pack(cmd=HolePunchingCommand(public_port)))
+                self._sel.register(public_sock, selectors.EVENT_READ, data=(Tag.UDP_PUBLIC, self._client_udp, service))
             else:
-                self._log(f"Unsupported channel type in REGISTER cmd: {cmd_instance.channel_type}")
-        elif response_type == ResponseType.READY_HOLE_PUNCHING:
-            # Client 发来准备打洞命令，Server应该开启监听
-            cmd_instance = cast(ReadyHolePunchingCommand, cmd_instance)
-            service = self._services[cmd_instance.public_port]
-            public_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            public_port = cmd_instance.public_port
-            public_sock.bind(("0.0.0.0", public_port))
-            ctl_channel.send(Protocol.pack(cmd=HolePunchingCommand(public_port)))
-            self._sel.register(public_sock, selectors.EVENT_READ, data=(Tag.UDP_PUBLIC, self._client_udp, service))
-        else:
-            self._log(f'Unknown response type {response_type}')
+                self._log(f'Unknown response type {response_type}')
+
+    def _cleanup_client(self, ctl_channel: socket.socket):
+        """Client 控制通道断开或协议错误：清理其名下所有服务、释放端口与连接"""
+        self._log(f"Client disconnected: {ctl_channel.getpeername()}")
+        try:
+            self._sel.unregister(ctl_channel)
+        except (KeyError, ValueError):
+            pass
+        for s in list(self._services.values()):
+            public_port = s.public_port
+            if ctl_channel == s.ctl:
+                if s.channel_type == ResponseType.TCP:
+                    s = cast(TCPService, s)
+                    if self._portAllocator is not None:
+                        self._portAllocator.free_a_port(public_port)
+                    self._sel.unregister(s.public_listen_sock)
+                    s.public_listen_sock.close()
+                    for conn_d in s.free_data_conns:
+                        try:
+                            self._sel.unregister(conn_d)
+                        except (KeyError, ValueError):
+                            pass
+                        conn_d.close()
+                    for conn_u in s.pending_users:
+                        try:
+                            self._sel.unregister(conn_u)
+                        except (KeyError, ValueError):
+                            pass
+                        conn_u.close()
+                    del self._services[public_port]
+                elif s.channel_type == ResponseType.UDP:
+                    s = cast(UDPService, s)
+                    # UDP 服务：释放端口 + 关闭公网监听 sock（若有）
+                    if self._portAllocator is not None:
+                        self._portAllocator.free_a_port(public_port)
+                    if s.public_sock is not None:
+                        try:
+                            self._sel.unregister(s.public_sock)
+                        except (KeyError, ValueError):
+                            pass
+                        s.public_sock.close()
+                    del self._services[public_port]
+        ctl_channel.close()
 
     def _tcp_accept_user(self, sock_listen, service: TCPService):
         # 某公网 TCP 端口有新外部用户
@@ -311,7 +368,12 @@ class Server:
         recv_data, addr = client_sock.recvfrom(2048)
         # 找session id
         sid, public_port, raw_data = self.unpack_udp(recv_data)
-        service = cast(UDPService, self._services[public_port])
+        service = self._services.get(public_port)
+        if service is None:
+            # 服务可能刚被断连清理删掉，在途的保活/数据包直接丢弃
+            self._log(f"UDP packet for unknown/closed service port {public_port}, dropping")
+            return
+        service = cast(UDPService, service)
 
         if sid == 0:
             # 打洞的包，只更新client_addr

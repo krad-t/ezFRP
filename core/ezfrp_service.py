@@ -19,6 +19,7 @@ class TCPService(BaseService):
 @dataclass
 class UDPService(BaseService):
     client_addr: tuple = None
+    public_sock: socket.socket = None      # 公网 UDP 监听 sock（READY_HOLE_PUNCHING 时创建）
     session_counter: int = 0
     addr2sid: dict = field(default_factory=dict)   # (user_ip, user_port) -> session_id
     sid2addr: dict = field(default_factory=dict)   # session_id -> (user_ip, user_port)
@@ -28,11 +29,13 @@ class UDPService(BaseService):
 
 @dataclass
 class TCPServiceClient(BaseService):
-    local_sock: socket.socket = None # 似乎没有用 TCPServiceClient 不需要额外记录
+    local_host: str = None
+    local_port: int = None
 
 @dataclass
 class UDPServiceClient(BaseService):
-    local_sock: socket.socket = None
+    local_host: str = None
+    local_port: int = None
     session_counter: int = 0
     sock2sid: dict = field(default_factory=dict)   # (user_ip, user_port) -> session_id
     sid2sock: dict = field(default_factory=dict)   # session_id -> (user_ip, user_port)

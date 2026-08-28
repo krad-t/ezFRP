@@ -3,13 +3,13 @@ import json
 
 
 try:
-    with open('ezfrp_client.json', 'r') as f:
+    with open('../config/ezfrp_client.json', 'r') as f:
         config_client = json.load(f)
 except FileNotFoundError:
     print('json not found')
 
 try:
-    with open('ezfrp_server.json', 'r') as f:
+    with open('../config/ezfrp_server.json', 'r') as f:
         config_server = json.load(f)
 except FileNotFoundError:
     print('json not found')

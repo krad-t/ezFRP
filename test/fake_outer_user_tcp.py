@@ -3,7 +3,7 @@ import json
 
 
 try:
-    with open('ezfrp_client.json', 'r') as f:
+    with open('../config/ezfrp_client.json', 'r') as f:
         config = json.load(f)
 except FileNotFoundError:
     print('json not found')
