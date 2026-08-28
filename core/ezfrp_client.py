@@ -1,8 +1,7 @@
 import struct
 import selectors
 from enum import IntEnum
-from shutil import chown
-from typing import cast
+from typing import cast, Any
 
 from ezfrp_service import *
 from protocol import *
@@ -20,6 +19,7 @@ class Tag(IntEnum):
 class Client:
     def __init__(self):
         self._config = self.configure()
+        self._service_configs: list[dict[str, Any]] = self._config.get("services", [])
         self._sel = selectors.DefaultSelector()
         self._sockets = []
         self._ctl = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -33,7 +33,7 @@ class Client:
 
     def run(self):
         self._sel.register(self._sig_r, selectors.EVENT_READ, data=(Tag.QUIT,))
-        self._sel.register(self._ctl, selectors.EVENT_READ, data=(Tag.CTL_RECV,))
+        self._sel.register(self._ctl, selectors.EVENT_READ, data=(Tag.CTL_RECV, FrameBuffer()))
         self._sel.register(self._udp_data_sock, selectors.EVENT_READ, data=(Tag.UDP_SERVER,))
         self._ctl.connect((self._config['server_ip'], self._config['tcp_endpoint']))
         self._log(f"Client connected to Server(1/2)")
@@ -47,7 +47,7 @@ class Client:
                     tag = key.data[0]
                     args = key.data[1:]
                     if tag == Tag.CTL_RECV:
-                        self._handle_ctl(sock)
+                        self._handle_ctl(sock, *args)
                     elif tag == Tag.TCP_RECV:
                         self._tcp_data_trans(sock, *args)
                     elif tag == Tag.UDP_SERVER:
@@ -70,85 +70,98 @@ class Client:
         self._udp_data_sock.sendto(self.pack_udp(sid=0, public_port=public_port, data=b''),
                                    (self._config["server_ip"], self._config["udp_endpoint"]))
 
-    def _handle_ctl(self, ctl):
+    def _handle_ctl(self, ctl, frame_buf: FrameBuffer):
         raw_data = ctl.recv(1024)
         if not raw_data:
             self._log("Server closed")
             self._sel.unregister(self._ctl)
             self._ctl.close()
             return
-        response_type, cmd_instance = Protocol.unpack(raw_data)
-        if response_type == ResponseType.CLIENT_LOGIN_COMPLETE:
-            self._log("Client login complete(2/2)")
+        try:
+            frames = frame_buf.feed(raw_data)
+        except ValueError:
+            self._log("Bad protocol data from server, ignoring")
+            return
+        for response_type, cmd_instance in frames:
+            if response_type == ResponseType.CLIENT_LOGIN_COMPLETE:
+                self._log("Client login complete(2/2)")
+                self._register_all_services(ctl)
+            elif response_type == ResponseType.REGISTER_COMPLETE:
+                cmd_instance = cast(RegisterCompleteCommand, cmd_instance)
+                public_port = cmd_instance.public_port
+                channel_type = cmd_instance.channel_type
+                svc_cfg = self._service_configs[cmd_instance.service_id]
+                self._log(f"{public_port}")
+                if channel_type == ResponseType.TCP:
+                    new_service = TCPServiceClient(
+                        ctl=ctl,
+                        channel_type=channel_type,
+                        public_port=public_port,
+                        local_host=svc_cfg["local_host"],
+                        local_port=svc_cfg["local_port"],
+                    )
+                    self._services[public_port] = new_service
 
-            choice = "0"
-            while choice != 'q':
-                choice = input("input to choose channel,TCP(1),UDP(2) or quit(q):")
-                if choice == "1":
-                    self._log("establish TCP channel", msg_before='\n')
-                    try:
-                        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        probe.settimeout(3)
-                        probe.connect((self._config["local_host"], self._config["local_port"]))
-                        probe.close()
-                    except (ConnectionRefusedError, OSError):
-                        self._log(f"Waiting Local APP at port {self._config['local_port']} start")
-                        continue
-                    ctl.send(Protocol.pack(cmd=RegisterCommand(ResponseType.TCP)))
-                    break
-                elif choice == "2":
-                    self._log("establish UDP channel", msg_before='\n')
-                    ctl.send(Protocol.pack(cmd=RegisterCommand(ResponseType.UDP)))
-                    break
-                # elif choice == "q":
-                #     self.quit()
-                #     break
+                elif channel_type == ResponseType.UDP:
+                    new_service = UDPServiceClient(
+                        ctl=ctl,
+                        public_port=public_port,
+                        channel_type=channel_type,
+                        local_host=svc_cfg["local_host"],
+                        local_port=svc_cfg["local_port"],
+                    )
+                    self._services[public_port] = new_service
+                    ctl.send(Protocol.pack(cmd=ReadyHolePunchingCommand(public_port)))
+                else:
+                    self._log(f"Unknown channel type {channel_type}")
 
-
-        elif response_type == ResponseType.REGISTER_COMPLETE:
-            cmd_instance = cast(RegisterCompleteCommand, cmd_instance)
-            public_port = cmd_instance.public_port
-            self._log(f"{public_port}")
-            channel_type = cmd_instance.channel_type
-            if channel_type == ResponseType.TCP:
-                new_service = TCPServiceClient(
-                    ctl=ctl,
-                    channel_type=channel_type,
-                    public_port=public_port
-                )
-                self._services[public_port] = new_service
-
-            elif channel_type == ResponseType.UDP:
-                new_service = UDPServiceClient(
-                    ctl=ctl,
-                    public_port=public_port,
-                    channel_type=channel_type,
-                )
-                self._services[public_port] = new_service
-                ctl.send(Protocol.pack(cmd=ReadyHolePunchingCommand(public_port)))
+                self._log(f"{channel_type} channel established, using {self._config['server_ip']}:{public_port} to connect")
+            elif response_type == ResponseType.NEW_USER:
+                cmd_instance = cast(NewUserCommand, cmd_instance)
+                service = cast(TCPServiceClient, self._services.get(cmd_instance.public_port))
+                if service is None:
+                    self._log(f"NEW_USER for unknown public port {cmd_instance.public_port}, ignored")
+                    continue
+                n_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                n_socket.connect((self._config['server_ip'], self._config['tcp_endpoint']))
+                n_socket.send(Protocol.pack(
+                    cmd=ServiceBindCommand(public_port=cmd_instance.public_port, channel_type=ResponseType.TCP)))
+                try:
+                    local_app_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    local_app_sock.connect((service.local_host, service.local_port))
+                except OSError:
+                    self._log(f"Local app at {service.local_host}:{service.local_port} not reachable, "
+                              f"dropping new user connection")
+                    n_socket.close()
+                    continue
+                self._sel.register(n_socket, selectors.EVENT_READ, data=(Tag.TCP_RECV, local_app_sock))
+                self._sel.register(local_app_sock, selectors.EVENT_READ, data=(Tag.TCP_RECV, n_socket))
+            elif response_type == ResponseType.HOLE_PUNCHING:
+                cmd_instance = cast(HolePunchingCommand, cmd_instance)
+                self._log(f"HOLE_PUNCHING{cmd_instance.public_port}")
+                self._hole_punching(public_port=cmd_instance.public_port)
+            elif response_type == ResponseType.HOLE_PUNCHING_COMPLETE:
+                cmd_instance = cast(HolePunchingCompleteCommand, cmd_instance)
+                self._log(f"hole punch complete")
             else:
-                self._log(f"Unknown channel type {channel_type}")
+                self._log("Client receive unknown response")
 
-            self._log(f"{channel_type} channel established, using {self._config['server_ip']}:{public_port} to connect")
-        elif response_type == ResponseType.NEW_USER:
-            local_app_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            local_app_sock.connect((self._config["local_host"], self._config["local_port"]))
-            cmd_instance = cast(NewUserCommand, cmd_instance)
-            n_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            n_socket.connect((self._config['server_ip'], self._config['tcp_endpoint']))
-            n_socket.send(Protocol.pack(
-                cmd=ServiceBindCommand(public_port=cmd_instance.public_port, channel_type=ResponseType.TCP)))
-            self._sel.register(n_socket, selectors.EVENT_READ, data=(Tag.TCP_RECV, local_app_sock))
-            self._sel.register(local_app_sock, selectors.EVENT_READ, data=(Tag.TCP_RECV, n_socket))
-        elif response_type == ResponseType.HOLE_PUNCHING:
-            cmd_instance = cast(HolePunchingCommand, cmd_instance)
-            self._log(f"HOLE_PUNCHING{cmd_instance.public_port}")
-            self._hole_punching(public_port=cmd_instance.public_port)
-        elif response_type == ResponseType.HOLE_PUNCHING_COMPLETE:
-            cmd_instance = cast(HolePunchingCompleteCommand, cmd_instance)
-            self._log(f"hole punch complete")
-        else:
-            self._log("Client receive unknown response")
+    def _register_all_services(self, ctl):
+        """登录完成后，按配置的 services 列表逐个向 Server 注册数据通道"""
+        for service_id, svc in enumerate(self._service_configs):
+            try:
+                channel_type = ResponseType(svc["channel_type"])
+            except ValueError:
+                self._log(f"Invalid channel_type in services[{service_id}]: {svc.get('channel_type')}, skipped")
+                continue
+            self._log(f"Registering service[{service_id}] {channel_type} "
+                      f"local {svc['local_host']}:{svc['local_port']} "
+                      f"public_port={svc.get('public_port', 0) or 'auto'}")
+            ctl.send(Protocol.pack(cmd=RegisterCommand(
+                channel_type=channel_type,
+                public_port=svc.get("public_port", 0),
+                service_id=service_id,
+            )))
 
     def _tcp_data_trans(self, sock_a: socket.socket, sock_b: socket.socket):
         # TCP socket pair 可读
@@ -184,10 +197,24 @@ class Client:
             fake_user_sock = service.sid2sock[sid]
 
         # 由假装的sock向本地应用发送数据
-        fake_user_sock.sendto(data, (self._config["local_host"], self._config["local_port"]))
+        fake_user_sock.sendto(data, (service.local_host, service.local_port))
 
     def _udp_data_l2s(self, fake_user_sock: socket.socket, sid: int, port: int):
-        recv_data, addr = fake_user_sock.recvfrom(2048)
+        try:
+            recv_data, addr = fake_user_sock.recvfrom(2048)
+        except (ConnectionResetError, OSError):
+            # 本地 UDP 应用不可达时（如 Windows 的 ICMP 端口不可达反馈），关闭该会话
+            service = cast(UDPServiceClient, self._services.get(port))
+            if service is not None:
+                service.sid2sock.pop(sid, None)
+                service.sock2sid.pop(fake_user_sock, None)
+            try:
+                self._sel.unregister(fake_user_sock)
+            except (KeyError, ValueError):
+                pass
+            fake_user_sock.close()
+            self._log(f"Local UDP app unreachable, session {sid} on public port {port} closed")
+            return
         service = cast(UDPServiceClient, self._services[port])
         packed_data = self.pack_udp(sid, port, recv_data)
         self._udp_data_sock.sendto(packed_data, (self._config["server_ip"], self._config["udp_endpoint"]))
@@ -202,20 +229,21 @@ class Client:
     def configure():
         import json
         try:
-            with open('ezfrp_client.json', 'r') as f:
+            with open('config/ezfrp_client.json', 'r') as f:
                 config = json.load(f)
         except FileNotFoundError:
             print('ezfrp_client.json not found, creating a new one using default configuration')
             config = {
-                "server_ip": "124.221.101.254",
+                "server_ip": "127.0.0.1",
                 "tcp_endpoint": 7000,
                 "udp_endpoint": 7001,
-
-                "local_host": "127.0.0.1",
-                "local_port": 25565
+                "services": [
+                    {"local_host": "127.0.0.1", "local_port": 8080, "public_port": 0, "channel_type": "TCP"},
+                    {"local_host": "127.0.0.1", "local_port": 5000, "public_port": 0, "channel_type": "UDP"}
+                ]
             }
-            with open('ezfrp_client.json', 'w') as f:
-                f.write(json.dumps(config))
+            with open('config/ezfrp_client.json', 'w') as f:
+                f.write(json.dumps(config, indent=2))
         return config
 
     @staticmethod

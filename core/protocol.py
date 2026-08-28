@@ -1,6 +1,7 @@
 from dataclasses import dataclass, asdict
 import json
 import socket
+import struct
 from typing import Type
 from abc import ABC, abstractmethod
 from enum import StrEnum
@@ -57,7 +58,8 @@ class NewUserCommand(BaseCommand):
 @dataclass
 class RegisterCommand(BaseCommand):
     channel_type: ResponseType
-    public_port: int = None
+    public_port: int = 0      # 0 = 由 Server 自动分配；非 0 = Client 声明需要的公网端口
+    service_id: int = 0       # Client 侧服务编号，Server 原样回传，用于 REGISTER_COMPLETE 回映到配置项
 
     @classmethod
     def get_cmd_type(cls) -> ResponseType:
@@ -69,6 +71,7 @@ class RegisterCommand(BaseCommand):
 class RegisterCompleteCommand(BaseCommand):
     public_port: int
     channel_type: ResponseType
+    service_id: int = 0
 
     @classmethod
     def get_cmd_type(cls) -> ResponseType:
@@ -133,18 +136,53 @@ class HolePunchingCompleteCommand(BaseCommand):
 
 
 class Protocol:
+    # 帧头：4 字节大端长度前缀 + JSON 载荷。一次 recv 可能包含多条/半条帧，
+    # 接收侧用 FrameBuffer 缓冲拆帧。
+    FRAME_HEADER = struct.Struct("!I")
+    MAX_FRAME_SIZE = 1 << 20  # 1MB，防坏数据撑爆内存(4字节无符号整数最大支持载荷是4GB,太大了)
+
     @staticmethod
     def pack(cmd: BaseCommand) -> bytes:
         payload = {
             "cmd_type": cmd.get_cmd_type().value,
             "data": asdict(cmd)
         }
-        return json.dumps(payload).encode()
+        body = json.dumps(payload).encode()
+        return Protocol.FRAME_HEADER.pack(len(body)) + body
 
     @staticmethod
-    def unpack(raw: bytes) -> tuple[ResponseType, BaseCommand]:
-        raw_data = json.loads(raw.decode())
+    def unpack(body: bytes) -> tuple[ResponseType, BaseCommand]:
+        """解析一条完整 JSON 载荷（不含帧头）"""
+        raw_data = json.loads(body.decode())
         cmd_type = ResponseType(raw_data["cmd_type"])
         cmd_class = COMMAND_REGISTRY[cmd_type]
         cmd_instance = cmd_class(**raw_data["data"])
         return cmd_type, cmd_instance
+
+
+class FrameBuffer:
+    """按 [4字节大端长度][JSON载荷] 拆帧的接收缓冲。
+
+    每个会话（控制通道/未知通道）维护一个实例：
+    feed() 塞入 recv 到的原始字节，返回本次解析出的全部完整命令；
+    剩余不足一帧的字节留在缓冲里，等下次 recv 继续喂。
+    """
+
+    def __init__(self):
+        self._buf = b""
+
+    def feed(self, data: bytes) -> list[tuple[ResponseType, BaseCommand]]:
+        self._buf += data
+        frames = []
+        while True:
+            if len(self._buf) < Protocol.FRAME_HEADER.size:
+                break
+            (length,) = Protocol.FRAME_HEADER.unpack(self._buf[:Protocol.FRAME_HEADER.size])
+            if length == 0 or length > Protocol.MAX_FRAME_SIZE:
+                raise ValueError(f"bad frame length {length}")
+            if len(self._buf) < Protocol.FRAME_HEADER.size + length:
+                break  # 半条帧，等待后续数据
+            body = self._buf[Protocol.FRAME_HEADER.size:Protocol.FRAME_HEADER.size + length]
+            self._buf = self._buf[Protocol.FRAME_HEADER.size + length:]
+            frames.append(Protocol.unpack(body))
+        return frames
