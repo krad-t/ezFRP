@@ -22,7 +22,7 @@
 - [x] Client 端可配置本地服务地址
 
 ## v0.5.0 ✅ 已完成
-- [ ] Selector 技术替换 threading（I/O 多路复用）
+- [x] Selector 技术替换 threading（I/O 多路复用）
 
 ## v0.6.0 - 进行中 feature/multi-client
 - [ ] 多 Client 支持（Server 同时服务多个 Client）
