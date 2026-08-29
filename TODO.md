@@ -22,12 +22,16 @@
 - [x] Client 端可配置本地服务地址
 
 ## v0.5.0 ✅ 已完成
-- [ ] Selector 技术替换 threading（I/O 多路复用）
+- [x] Selector 技术替换 threading（I/O 多路复用）
 
-## v0.6.0 - 进行中 feature/multi-client
-- [ ] 多 Client 支持（Server 同时服务多个 Client）
-- [ ] 每 Client 独立公网端口 + 端口注册协议
-- [ ] Client 注册时声明"我需要服务端口 XXXX"
+## v0.6.0 ✅ 已完成 feature/multi-client
+- [x] 多 Client 支持（Server 同时服务多个 Client）
+- [x] 每 Client 独立公网端口 + 端口注册协议
+- [x] Client 注册时声明"我需要服务端口 XXXX"（RegisterCommand.public_port，冲突时 Server 自动改分）
+- [x] 客户端配置化：去掉 input() 交互，按 config/services 列表自动注册（service_id 回映配置项）
+- [x] 控制通道协议分帧（4 字节长度前缀 + FrameBuffer），支持一次 recv 多条命令
+- [x] 配置文件统一迁移到 config/ 目录
+- [x] 断连清理：UDP 服务释放端口/关闭公网 sock；在途 UDP 包容错
 
 ## v0.7.0
 - [ ] Docker 部署（Dockerfile + docker-compose.yml）

@@ -3,14 +3,15 @@ import json
 
 
 try:
-    with open('ezfrp_client.json', 'r') as f:
+    with open('../config/ezfrp_client.json', 'r') as f:
         config = json.load(f)
 except FileNotFoundError:
     print('json not found')
 
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 SERVER_IP = config['server_ip']
-s.connect((SERVER_IP,9999))
+port = int(input("port:"))
+s.connect((SERVER_IP,port))
 while True:
     data = input(f"input anything(q to quit){s.getsockname()}:")
     if data == 'q':
