@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 import socket
-from protocol import ResponseType
+from .protocol import ResponseType
 
 @dataclass
 class BaseService:

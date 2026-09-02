@@ -1,11 +1,12 @@
+import os
 import struct
 import selectors
 import heapq
 from typing import cast
-from enum import IntEnum, nonmember
+from enum import IntEnum
 
-from protocol import *
-from ezfrp_service import *
+from .protocol import *
+from .ezfrp_service import *
 
 
 class Tag(IntEnum):
@@ -29,9 +30,12 @@ class Server:
                 heapq.heappush(self._data, port)
 
         def get_a_free_port(self) -> int:
-            port = heapq.heappop(self._data)
-            self._used[port] = True
-            return port
+            try:
+                port = heapq.heappop(self._data)
+                self._used[port] = True
+                return port
+            except IndexError as e:
+                raise IndexError("No available port") from e
 
         def reserve(self, port: int) -> bool:
             """尝试预留指定端口；成功返回 True，端口被占用或不在池内返回 False"""
@@ -43,8 +47,11 @@ class Server:
             return True
 
         def free_a_port(self, port: int):
-            heapq.heappush(self._data, port)
-            self._used.pop(port, None)
+            if self.is_used(port):
+                heapq.heappush(self._data, port)
+                self._used.pop(port, None)
+            else:
+                return
 
         def is_used(self, port: int) -> bool:
             return port in self._used
@@ -102,7 +109,10 @@ class Server:
         else:
             if requested_port:
                 self._log(f"Requested port {requested_port} unavailable, auto-assigning")
-            public_port = self._portAllocator.get_a_free_port()
+            try:
+                public_port = self._portAllocator.get_a_free_port()
+            except IndexError as e:
+                raise e
 
         if service.channel_type == ResponseType.UDP:
             service.public_port = public_port
@@ -124,7 +134,6 @@ class Server:
 
         return public_port
 
-
     def _log(self, msg):
         from datetime import datetime
         print(f"[{type(self).__name__}//{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] {msg}")
@@ -132,8 +141,10 @@ class Server:
     @staticmethod
     def configure():
         import json
+        REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        path = os.path.join(REPO_ROOT, 'config', 'ezfrp_server.json')
         try:
-            with open('../config/ezfrp_server.json', 'r') as f:
+            with open(path, 'r') as f:
                 config = json.load(f)
         except FileNotFoundError:
             print('ezfrp_server.json not found, creating a new one using default configuration')
@@ -144,7 +155,7 @@ class Server:
                 "min_port": 9900
             }
 
-            with open('../config/ezfrp_server.json', 'w') as f:
+            with open(path, 'w') as f:
                 f.write(json.dumps(config))
         return config
 
@@ -225,27 +236,49 @@ class Server:
                             ctl=ctl_channel,
                             channel_type=ResponseType.UDP,
                         )
-                        public_port = self._assign_service_ports(new_service, requested_port=cmd_instance.public_port)
+                        # 处理Server端口占满的情况,应该直接失败？毕竟此时意味着服务端端口已满？或者增加队列？但是那样又更复杂了——还要考虑队列满了情况？
+                        # 不如就直接失败，返回给client一个消息表面端口已满
+                        try:
+                            public_port = self._assign_service_ports(new_service,
+                                                                     requested_port=cmd_instance.public_port)
+                            self._services[public_port] = new_service
+                            new_service.ctl.send(Protocol.pack(
+                                cmd=RegisterCompleteCommand(public_port=public_port,
+                                                            channel_type=new_service.channel_type,
+                                                            service_id=cmd_instance.service_id)))
+                        except IndexError as e:
+                            self._log(f"Failed to register {cmd_instance.service_id}: {e}, because no available port")
+                            new_service.ctl.send(Protocol.pack(
+                                cmd=RegisterFailCommand(channel_type=new_service.channel_type,
+                                                        service_id=cmd_instance.service_id,
+                                                        msg="Server busy, no available port")
+                            ))
 
-                        self._services[public_port] = new_service
-                        new_service.ctl.send(Protocol.pack(
-                            cmd=RegisterCompleteCommand(public_port=public_port,
-                                                        channel_type=new_service.channel_type,
-                                                        service_id=cmd_instance.service_id)))
                     elif cmd_instance.channel_type == ResponseType.TCP:
                         new_service = TCPService(
                             ctl=ctl_channel,
                             channel_type=ResponseType.TCP
                         )
-                        public_port = self._assign_service_ports(new_service, requested_port=cmd_instance.public_port)
-                        self._services[public_port] = new_service
+                        # 处理Server端口占满的情况，同上
+                        try:
 
-                        self._sel.register(new_service.public_listen_sock, selectors.EVENT_READ,
-                                           data=(Tag.TCP_ACCEPT, new_service))
-                        new_service.ctl.send(Protocol.pack(
-                            cmd=RegisterCompleteCommand(public_port=public_port,
-                                                        channel_type=new_service.channel_type,
-                                                        service_id=cmd_instance.service_id)))
+                            public_port = self._assign_service_ports(new_service,
+                                                                     requested_port=cmd_instance.public_port)
+                            self._services[public_port] = new_service
+
+                            self._sel.register(new_service.public_listen_sock, selectors.EVENT_READ,
+                                               data=(Tag.TCP_ACCEPT, new_service))
+                            new_service.ctl.send(Protocol.pack(
+                                cmd=RegisterCompleteCommand(public_port=public_port,
+                                                            channel_type=new_service.channel_type,
+                                                            service_id=cmd_instance.service_id)))
+                        except IndexError as e:
+                            self._log(f"Failed to register {cmd_instance.service_id}: {e}, because no available port")
+                            new_service.ctl.send(Protocol.pack(
+                                cmd=RegisterFailCommand(channel_type=new_service.channel_type,
+                                                        service_id=cmd_instance.service_id,
+                                                        msg="Server busy, no available port")
+                            ))
                     else:
                         self._log(f"Unsupported channel type in REGISTER cmd: {cmd_instance.channel_type}")
                 except OSError:
@@ -388,6 +421,7 @@ class Server:
 
 if __name__ == '__main__':
     import threading
+
     s = Server()
     threading.Thread(target=s.run, daemon=True).start()
     while True:

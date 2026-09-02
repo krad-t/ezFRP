@@ -1,10 +1,11 @@
+import os
 import struct
 import selectors
 from enum import IntEnum
 from typing import cast, Any
 
-from ezfrp_service import *
-from protocol import *
+from .ezfrp_service import *
+from .protocol import *
 
 
 class Tag(IntEnum):
@@ -66,7 +67,7 @@ class Client:
     def signal_quit(self):
         self._sig_w.send(b"\x00")
 
-    def _hole_punching(self,public_port:int):
+    def _hole_punching(self, public_port: int):
         self._udp_data_sock.sendto(self.pack_udp(sid=0, public_port=public_port, data=b''),
                                    (self._config["server_ip"], self._config["udp_endpoint"]))
 
@@ -115,7 +116,13 @@ class Client:
                 else:
                     self._log(f"Unknown channel type {channel_type}")
 
-                self._log(f"{channel_type} channel established, using {self._config['server_ip']}:{public_port} to connect")
+                self._log(
+                    f"{channel_type} channel established, using {self._config['server_ip']}:{public_port} to connect")
+            elif response_type == ResponseType.REGISTER_FAIL:
+                msg = cast(RegisterFailCommand, cmd_instance).msg
+                self._log(f"Client register failed, {msg}")
+                # todo 后期加上指定次数的自动重试？
+                continue
             elif response_type == ResponseType.NEW_USER:
                 cmd_instance = cast(NewUserCommand, cmd_instance)
                 service = cast(TCPServiceClient, self._services.get(cmd_instance.public_port))
@@ -228,8 +235,10 @@ class Client:
     @staticmethod
     def configure():
         import json
+        REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        path = os.path.join(REPO_ROOT, 'config', 'ezfrp_client.json')
         try:
-            with open('../config/ezfrp_client.json', 'r') as f:
+            with open(path, 'r') as f:
                 config = json.load(f)
         except FileNotFoundError:
             print('ezfrp_client.json not found, creating a new one using default configuration')
@@ -242,7 +251,7 @@ class Client:
                     {"local_host": "127.0.0.1", "local_port": 5000, "public_port": 0, "channel_type": "UDP"}
                 ]
             }
-            with open('../config/ezfrp_client.json', 'w') as f:
+            with open(path, 'w') as f:
                 f.write(json.dumps(config, indent=2))
         return config
 
@@ -257,11 +266,11 @@ class Client:
         packet_data = data[header_size:]
         return session_id, public_port, packet_data
 
-
     def quit(self):
         self._ctl.close()
         import sys
         sys.exit(0)
+
 
 if __name__ == '__main__':
     import threading
@@ -275,4 +284,3 @@ if __name__ == '__main__':
             client.signal_quit()
             break
     t.join()
-
